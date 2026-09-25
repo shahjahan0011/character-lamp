@@ -34,6 +34,10 @@ def main() -> None:
 
     try:
         while True:
+            if not p.isConnected(physicsClientId=sim._client):
+                print("Window closed -- exiting.")
+                return
+
             for name, slider_id in joint_sliders.items():
                 sim.set_joint_angle(name, p.readUserDebugParameter(slider_id))
 
@@ -49,7 +53,8 @@ def main() -> None:
     except KeyboardInterrupt:
         pass
     finally:
-        sim.close()
+        if p.isConnected(physicsClientId=sim._client):
+            sim.close()
 
 
 if __name__ == "__main__":
