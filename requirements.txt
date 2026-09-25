@@ -5,7 +5,10 @@
 pybullet>=3.2.6
 pydantic>=2.6
 numpy>=1.26
-opencv-python>=4.9
+# Pinned below 5.0: opencv-python 5.x removed CascadeClassifier entirely
+# (replaced by the DNN-based FaceDetectorYN), breaking the Haar-cascade
+# approach this project uses for engagement detection.
+opencv-python>=4.9,<5
 sounddevice>=0.4.6
 soundfile>=0.12
 webrtcvad>=2.0.10
