@@ -49,6 +49,7 @@ class DialogueWorker:
 
         self._result_lock = threading.Lock()
         self._ready_reply: Optional[ReadyReply] = None
+        self._failed = False
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -73,6 +74,17 @@ class DialogueWorker:
             reply, self._ready_reply = self._ready_reply, None
         return reply
 
+    def pop_failure(self) -> bool:
+        """Non-blocking poll for "the last turn errored out" (timeout, or
+        any other exception) -- separate from get_ready_reply() so the
+        caller can react visibly (see CharacterOrchestrator._on_turn_error)
+        instead of a failed turn just silently producing nothing, which is
+        indistinguishable from "no speech was recognized" from the
+        outside."""
+        with self._result_lock:
+            failed, self._failed = self._failed, False
+        return failed
+
     def _run(self) -> None:
         while True:
             utterance = self._input.get()
@@ -81,6 +93,8 @@ class DialogueWorker:
                 self._process(utterance)
             except Exception:  # noqa: BLE001 -- one bad turn shouldn't kill the worker
                 self._on_debug(f"dialogue worker error:\n{traceback.format_exc()}")
+                with self._result_lock:
+                    self._failed = True
             finally:
                 self._busy.clear()
 
