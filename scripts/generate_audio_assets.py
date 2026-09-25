@@ -46,6 +46,22 @@ def make_chime() -> np.ndarray:
     return _fade(out, int(SR * 0.02))
 
 
+def make_thinking_hum() -> np.ndarray:
+    """A soft, low "hmm" -- plays once as thinking starts, so the long
+    wait for a reply reads as active pondering from the first moment,
+    not silence."""
+    dur = 1.1
+    t = np.linspace(0, dur, int(SR * dur), endpoint=False)
+    base_hz = 165.0  # low, warm -- a hum, not a chime
+    vibrato = 1.0 + 0.015 * np.sin(2 * np.pi * 5.0 * t)  # gentle wobble
+    tone = 0.5 * np.sin(2 * np.pi * base_hz * vibrato * t)
+    tone += 0.2 * np.sin(2 * np.pi * base_hz * 2 * vibrato * t)
+    envelope = np.clip(np.sin(np.pi * t / dur), 0, 1) ** 0.6
+    tone *= envelope
+    tone = tone / max(np.abs(tone).max(), 1e-9) * 0.5
+    return _fade(tone, int(SR * 0.05))
+
+
 def make_lounge_loop(duration_s: float = 16.0) -> np.ndarray:
     """A slow, soft ambient pad loop -- ii-V-I-vi style chord bed with a
     gentle filtered-noise "shaker" pulse, meant to sit quietly in the
@@ -110,6 +126,10 @@ def main() -> None:
     chime_path = os.path.join(sfx_dir, "engage_chime.wav")
     sf.write(chime_path, make_chime(), SR)
     print(f"Wrote {chime_path}")
+
+    hum_path = os.path.join(sfx_dir, "thinking_hum.wav")
+    sf.write(hum_path, make_thinking_hum(), SR)
+    print(f"Wrote {hum_path}")
 
     loop_path = os.path.join(music_dir, "lounge_loop.wav")
     sf.write(loop_path, make_lounge_loop(), SR)

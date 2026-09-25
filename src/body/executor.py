@@ -84,6 +84,8 @@ EXCITED_FLASH_COLOR = (1.0, 0.75, 0.3)
 CURIOUS_NECK_TILT = 0.35
 CURIOUS_HEAD_TILT = -0.15
 CURIOUS_HOLD_S = 0.4
+THINK_HEAD_DIP = 0.12
+THINK_SPEED_SCALE = 0.4
 
 # Idle wandering (nobody engaged): gentle, curious-looking drift, not the
 # alert "attentive" lean used for look_at -- the two poses should read as
@@ -173,6 +175,14 @@ class ActionExecutor:
             )
             time.sleep(CURIOUS_HOLD_S)
             self._move_and_settle({"neck_yaw_joint": neck, "head_pitch_joint": head}, speed_scale=0.5)
+        elif action.kind == "think":
+            # A slow, single dip-and-return -- meant to be called repeatedly
+            # (every few seconds) while waiting on a reply, so it reads as
+            # continuous, gentle pondering rather than one gesture.
+            current = self.sim.get_all_joint_angles()
+            head = current["head_pitch_joint"]
+            self._move_and_settle({"head_pitch_joint": head + THINK_HEAD_DIP}, speed_scale=THINK_SPEED_SCALE)
+            self._move_and_settle({"head_pitch_joint": head}, speed_scale=THINK_SPEED_SCALE)
         elif action.kind == "home":
             self._move_and_settle(HOME_POSE, speed_scale)
         elif action.kind == "idle_sway":
