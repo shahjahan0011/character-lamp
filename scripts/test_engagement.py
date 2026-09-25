@@ -18,7 +18,7 @@ from src.perception.engagement import EngagementWatcher
 
 
 def main() -> None:
-    sim = LampSimulator(gui=True)
+    sim = LampSimulator(gui=True, clean_gui=True)
     executor = ActionExecutor(sim)
     watcher = EngagementWatcher()
 

@@ -55,7 +55,7 @@ class JointLimits:
 class LampSimulator:
     """Thin wrapper around a PyBullet instance holding the lamp URDF."""
 
-    def __init__(self, gui: bool = False, urdf_path: str = URDF_PATH):
+    def __init__(self, gui: bool = False, clean_gui: bool = False, urdf_path: str = URDF_PATH):
         self._client = p.connect(p.GUI if gui else p.DIRECT)
         p.setGravity(0, 0, -9.81, physicsClientId=self._client)
         self._add_floor()
@@ -73,6 +73,24 @@ class LampSimulator:
                 cameraTargetPosition=[0, 0, 0.3],
                 physicsClientId=self._client,
             )
+            # PyBullet's default GUI continuously re-renders three extra
+            # synthetic camera views (RGB/depth/segmentation) alongside the
+            # main 3D view, regardless of whether anything reads them --
+            # likely the bulk of the CPU cost for what should just be a
+            # live view of the lamp. Always off; nothing here uses them.
+            for flag in (
+                p.COV_ENABLE_RGB_BUFFER_PREVIEW,
+                p.COV_ENABLE_DEPTH_BUFFER_PREVIEW,
+                p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW,
+            ):
+                p.configureDebugVisualizer(flag, 0, physicsClientId=self._client)
+
+            if clean_gui:
+                # Also drop the full debug-panel chrome (explorer tree,
+                # params, robotics control) for an actual demo recording --
+                # but this also hides addUserDebugParameter sliders, so
+                # view_lamp.py (which needs them) doesn't set this.
+                p.configureDebugVisualizer(p.COV_ENABLE_GUI, 0, physicsClientId=self._client)
 
         self._joint_index: dict[str, int] = {}
         self._link_index: dict[str, int] = {}
