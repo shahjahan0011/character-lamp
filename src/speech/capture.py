@@ -34,6 +34,16 @@ SAMPLE_RATE = 16000  # webrtcvad only accepts 8000/16000/32000/48000
 FRAME_MS = 30  # webrtcvad only accepts 10/20/30ms frames
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 
+# How long to keep listening after engagement drops if we're mid-utterance
+# when it does. Without this, a person naturally glancing down/away while
+# still mid-sentence (extremely common -- you don't stare at a webcam while
+# forming a thought) gets disengaged by the face detector, which used to
+# discard the in-progress recording immediately, before the silence-based
+# endpointing below ever got a chance to notice they'd actually finished
+# talking. Confirmed via a live test: "speech started" fired every time,
+# "utterance finished" never did -- DISENGAGE always cut in first.
+GRACE_PERIOD_S = 1.5
+
 
 def _pcm16_to_wav_bytes(pcm_bytes: bytes) -> bytes:
     audio = np.frombuffer(pcm_bytes, dtype=np.int16)
@@ -70,6 +80,7 @@ class SpeechCapture:
         self._min_speech_frames = max(1, min_utterance_ms // FRAME_MS)
 
         self._active = threading.Event()
+        self._deactivated_at: float | None = None
         self._running = False
         self._stream: sd.InputStream | None = None
         self._thread: threading.Thread | None = None
@@ -83,15 +94,18 @@ class SpeechCapture:
     # -- control (called from the main/orchestrator thread) -----------------
 
     def set_active(self, active: bool) -> None:
-        """Engagement dropping mid-utterance discards whatever was buffered
-        so far, rather than trying to salvage a half-finished recording --
-        the person plausibly just glanced away, but we shouldn't guess."""
+        """Turning off doesn't instantly stop listening -- see
+        GRACE_PERIOD_S. If nothing was mid-utterance, the grace period
+        costs nothing (the run loop just sees silence and never triggers)."""
         if active:
             self._active.set()
+            self._deactivated_at = None
         else:
             self._active.clear()
-            with self._capture_lock:
-                self._pending_frames = []
+            self._deactivated_at = time.time()
+
+    def _in_grace_period(self) -> bool:
+        return self._deactivated_at is not None and (time.time() - self._deactivated_at) < GRACE_PERIOD_S
 
     def get_pending_utterance(self) -> Utterance | None:
         """Returns and clears the most recently completed utterance, if any
@@ -124,7 +138,7 @@ class SpeechCapture:
     # -- capture thread + its own audio-driver callback ----------------------
 
     def _audio_callback(self, indata, frames, time_info, status) -> None:
-        if not self._active.is_set():
+        if not self._active.is_set() and not self._in_grace_period():
             return
         with self._capture_lock:
             self._pending_frames.append(bytes(indata))
@@ -138,10 +152,14 @@ class SpeechCapture:
         voiced_since_log = 0
 
         while self._running:
-            if not self._active.is_set():
+            if not self._active.is_set() and not self._in_grace_period():
+                if triggered:
+                    self._on_debug("speech capture: grace period expired mid-utterance, discarding")
                 triggered = False
                 voiced_frames = []
                 ring_buffer.clear()
+                with self._capture_lock:
+                    self._pending_frames = []
                 time.sleep(0.05)
                 continue
 
