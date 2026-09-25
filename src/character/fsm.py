@@ -149,6 +149,14 @@ class CharacterOrchestrator:
     def _check_dialogue_reply(self, currently_engaged: bool) -> None:
         if self.dialogue_worker is None:
             return
+        if self.dialogue_worker.pop_failure():
+            # A real error (timeout, network failure, etc.) -- without
+            # this, a failed turn and "no speech was recognized" look
+            # identical from the outside: nothing happens. Visible cue
+            # only if still engaged; nobody to show it to otherwise.
+            if currently_engaged:
+                self._on_error()
+            return
         reply = self.dialogue_worker.get_ready_reply()
         if reply is None:
             return
@@ -164,6 +172,10 @@ class CharacterOrchestrator:
         self._speak_synthesized(reply.audio_bytes)
         if reply.gesture != "none":
             self.executor.run(Action(kind=reply.gesture, params={}))
+
+    def _on_error(self) -> None:
+        self.executor.run(Action(kind="shake_head", params={}))
+        self._restore_engaged_light()
 
     def _speak_synthesized(self, audio_bytes: bytes) -> None:
         """Plays audio already synthesized by DialogueWorker -- deliberately

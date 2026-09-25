@@ -23,6 +23,14 @@ real tool call, the model is asked to emit all fields in one plain-text
 response, parsed with a regex. Less elegant, but it's predictable extra
 lines in a call we already know works, rather than a new API shape to get
 subtly wrong under time pressure.
+
+Free-tier latency is genuinely variable, not just slow: one measured call
+succeeded in 23.1s, another timed out entirely at 60s in the same
+session. timeout_s is set well above the fast case specifically to
+tolerate that variance rather than chase a "correct" number that doesn't
+exist -- a slow-but-successful call is much better than a needlessly
+aborted one. DialogueWorker still surfaces a real timeout as a visible
+"something went wrong" cue rather than silence; see its _failed flag.
 """
 
 from __future__ import annotations
@@ -124,7 +132,7 @@ def respond(transcript: str, timeout_s: float = 30.0) -> DialogueResponse:
     return _parse(interaction.output_text or "")
 
 
-def respond_to_audio(wav_bytes: bytes, timeout_s: float = 60.0) -> AudioDialogueResponse:
+def respond_to_audio(wav_bytes: bytes, timeout_s: float = 100.0) -> AudioDialogueResponse:
     client = get_client()
     interaction = client.interactions.create(
         model=TEXT_MODEL,
