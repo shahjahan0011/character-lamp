@@ -36,16 +36,26 @@ class EngagementWatcher:
         self,
         camera_index: int = 0,
         frames_to_engage: int = 3,
-        frames_to_disengage: int = 20,
-        detect_every_n_frames: int = 2,
+        frames_to_disengage: int = 15,
+        detect_hz: float = 8.0,
+        detect_width: int = 320,
     ):
         # Hysteresis: a few steady "face seen" frames to engage (fast, since
         # noticing someone should feel immediate) but many more steady
         # "no face" frames to disengage (slow, so a blink or a half-second
         # head turn doesn't make the lamp flicker in and out of attention).
+        # Both counts are in units of *detections*, not camera frames -- see
+        # detect_hz.
         self._frames_to_engage = frames_to_engage
         self._frames_to_disengage = frames_to_disengage
-        self._detect_every_n_frames = detect_every_n_frames
+        # Haar detection on a full-resolution frame is expensive enough to
+        # peg a CPU core if run flat-out at the camera's native frame rate,
+        # which visibly starves everything else (PyBullet's renderer
+        # included) of CPU. Two independent cheap fixes: cap the detection
+        # rate, and detect on a small downscaled copy of the frame (the
+        # fractional face position we need doesn't care about resolution).
+        self._detect_interval_s = 1.0 / detect_hz
+        self._detect_width = detect_width
 
         self._cascade = cv2.CascadeClassifier(
             cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
@@ -83,7 +93,7 @@ class EngagementWatcher:
     def _run(self) -> None:
         consecutive_face = 0
         consecutive_absent = 0
-        frame_count = 0
+        next_detect_at = 0.0
 
         while self._running:
             ok, frame = self._capture.read()
@@ -91,20 +101,27 @@ class EngagementWatcher:
                 time.sleep(0.05)
                 continue
 
-            frame_count += 1
-            if frame_count % self._detect_every_n_frames != 0:
+            now = time.time()
+            if now < next_detect_at:
+                # Still capture (so the driver's buffer doesn't back up),
+                # but skip the expensive detection pass and don't spin.
+                time.sleep(0.01)
                 continue
+            next_detect_at = now + self._detect_interval_s
+
+            frame_h, frame_w = frame.shape[:2]
+            scale = self._detect_width / frame_w
+            small = cv2.resize(frame, (self._detect_width, int(frame_h * scale)))
 
             face_x_frac = 0.0
             found = False
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            faces = self._cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+            gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY)
+            faces = self._cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
             if len(faces) > 0:
                 # Largest face = closest/most prominent person in frame.
                 x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-                frame_width = frame.shape[1]
                 center_x = x + w / 2
-                face_x_frac = (center_x / frame_width) * 2 - 1  # -1 .. +1
+                face_x_frac = (center_x / small.shape[1]) * 2 - 1  # -1 .. +1
                 found = True
 
             if found:
