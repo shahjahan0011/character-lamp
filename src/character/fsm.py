@@ -1,13 +1,16 @@
 """Ties perception signals to body actions.
 
-For now this only handles engagement (demo moments 1 and 2): notice someone,
-acknowledge them, dim back down when they leave. Speech/memory/goal states
-get added here later without changing how this part works -- it just reads
-whatever `EngagementWatcher.get_state()` says and reacts.
+Handles engagement (demo moments 1 and 2: notice someone, acknowledge them,
+dim back down when they leave) and spoken interaction (demo moment 3: only
+listens while engaged, transcribes, replies). Memory/goal states get added
+here later without changing how this part works -- it just reads whatever
+EngagementWatcher/SpeechCapture report and reacts.
 
-Deliberately not calling the LLM for this reaction (see design discussion):
-it needs to feel instantaneous, and a network round-trip would undercut
-that, so the acknowledgment is a fixed, hardcoded Action sequence.
+Deliberately not calling the LLM for the engagement *reaction* (see design
+discussion): it needs to feel instantaneous, and a network round-trip would
+undercut that, so the acknowledgment is a fixed, hardcoded Action sequence.
+The spoken reply, by contrast, has to go through the LLM -- there's no
+faking "understood what you said and answered it".
 """
 
 from __future__ import annotations
@@ -19,6 +22,8 @@ from typing import Callable, Optional
 from src.body.executor import ActionExecutor
 from src.perception.engagement import EngagementWatcher
 from src.protocol.models import Action
+from src.speech.capture import SpeechCapture
+from src.speech import dialogue, stt
 
 MAX_PAN_RAD = 0.7  # radians; matches base_yaw_joint's usable range for a look
 
@@ -41,10 +46,12 @@ class CharacterOrchestrator:
         self,
         executor: ActionExecutor,
         watcher: EngagementWatcher,
+        speech: Optional[SpeechCapture] = None,
         on_debug: Optional[Callable[[str], None]] = None,
     ):
         self.executor = executor
         self.watcher = watcher
+        self.speech = speech
         self._last_engaged = False
         # Optional hook for tests/scripts to print what's happening -- the
         # executor swallows action exceptions into telemetry by design (one
@@ -84,8 +91,32 @@ class CharacterOrchestrator:
             self._on_debug("idle wander")
             self.executor.run(Action(kind="idle_sway", params={}))
             self._next_idle_wander_at = self._schedule_next_idle_wander()
+        elif state.engaged and self.speech is not None:
+            self._check_speech()
         self._last_engaged = state.engaged
         self._report_failures()
+
+    def _check_speech(self) -> None:
+        utterance = self.speech.get_pending_utterance()
+        if utterance is None:
+            return
+        self._on_debug(f"heard {utterance.duration_s:.1f}s of speech, transcribing...")
+        try:
+            transcript = stt.transcribe(utterance.wav_bytes)
+        except Exception as exc:  # noqa: BLE001 -- one bad STT call shouldn't kill the demo
+            self._on_debug(f"STT FAILED: {exc}")
+            return
+        if not transcript:
+            self._on_debug("(transcript empty -- likely no speech in that clip)")
+            return
+        self._on_debug(f'  transcript: "{transcript}"')
+        try:
+            reply = dialogue.respond(transcript)
+        except Exception as exc:  # noqa: BLE001
+            self._on_debug(f"DIALOGUE FAILED: {exc}")
+            return
+        self._on_debug(f'  reply: "{reply}"')
+        self.executor.run(Action(kind="speak", params={"text": reply}))
 
     def _report_failures(self) -> None:
         for t in self.executor.drain_telemetry():
@@ -109,8 +140,12 @@ class CharacterOrchestrator:
         self.executor.run(
             Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": ENGAGED_BRIGHTNESS})
         )
+        if self.speech is not None:
+            self.speech.set_active(True)
 
     def _on_disengage(self) -> None:
+        if self.speech is not None:
+            self.speech.set_active(False)
         self.executor.run(
             Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": IDLE_BRIGHTNESS})
         )

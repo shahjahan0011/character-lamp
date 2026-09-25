@@ -74,6 +74,18 @@ def play_once(path: str, volume: float = 1.0, blocking: bool = False) -> None:
         sd.wait()
 
 
+def play_bytes(wav_bytes: bytes, volume: float = 1.0, blocking: bool = True) -> None:
+    """Plays in-memory WAV bytes (e.g. a TTS reply) -- default blocking=True
+    since "speak" is meant to occupy the character for as long as it's
+    talking, same as a gesture occupies it for as long as it's moving."""
+    import io
+
+    data, samplerate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    sd.play(data * volume, samplerate)
+    if blocking:
+        sd.wait()
+
+
 SFX_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "sfx")
 MUSIC_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "music")
 
@@ -81,19 +93,34 @@ ENGAGE_CHIME_PATH = os.path.join(SFX_DIR, "engage_chime.wav")
 LOUNGE_LOOP_PATH = os.path.join(MUSIC_DIR, "lounge_loop.wav")
 
 
-def make_audio_hooks(music_volume: float = 0.5) -> dict:
-    """Builds the on_play_sound/on_music_on/on_music_off callables for
-    ExecutorHooks, backed by real playback. A thin adapter so
-    ActionExecutor/CharacterOrchestrator never import sounddevice directly --
-    they only ever see the Action vocabulary (play_sound/music_on/music_off)."""
+def make_audio_hooks(music_volume: float = 0.5, speak: bool = True) -> dict:
+    """Builds the on_play_sound/on_music_on/on_music_off/on_speak callables
+    for ExecutorHooks, backed by real playback (and, for on_speak, a real
+    Gemini TTS call). A thin adapter so ActionExecutor/CharacterOrchestrator
+    never import sounddevice or the speech modules directly -- they only
+    ever see the Action vocabulary (play_sound/music_on/music_off/speak).
+
+    speak=False skips wiring on_speak (leaves ExecutorHooks' no-op default)
+    for callers that don't have a Gemini key configured yet and don't want
+    a "speak" action to raise."""
     music = MusicLoop(LOUNGE_LOOP_PATH, volume=music_volume)
 
     def on_play_sound(name: str) -> None:
         path = os.path.join(SFX_DIR, name) if not os.path.isabs(name) else name
         play_once(path)
 
-    return {
+    hooks = {
         "on_play_sound": on_play_sound,
         "on_music_on": music.start,
         "on_music_off": music.stop,
     }
+
+    if speak:
+        from . import tts  # deferred: only needed (and only requires a key) if speak=True
+
+        def on_speak(text: str) -> None:
+            play_bytes(tts.synthesize(text))
+
+        hooks["on_speak"] = on_speak
+
+    return hooks
