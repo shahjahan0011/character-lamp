@@ -12,6 +12,7 @@ that, so the acknowledgment is a fixed, hardcoded Action sequence.
 
 from __future__ import annotations
 
+import random
 import time
 from typing import Callable, Optional
 
@@ -20,6 +21,13 @@ from src.perception.engagement import EngagementWatcher
 from src.protocol.models import Action
 
 MAX_PAN_RAD = 0.7  # radians; matches base_yaw_joint's usable range for a look
+
+# While nobody's engaged, the lamp wanders on its own every so often --
+# otherwise it just sits frozen, which reads as "off" rather than "alive but
+# not paying attention to anyone right now". The moment someone engages,
+# this stops entirely and the lamp focuses on them instead (see tick()).
+IDLE_WANDER_MIN_INTERVAL_S = 4.0
+IDLE_WANDER_MAX_INTERVAL_S = 9.0
 
 
 class CharacterOrchestrator:
@@ -37,6 +45,10 @@ class CharacterOrchestrator:
         # bad action shouldn't kill the demo), which otherwise means a
         # failure looks identical to "nothing happened". This surfaces it.
         self._on_debug = on_debug or (lambda msg: None)
+        self._next_idle_wander_at = self._schedule_next_idle_wander()
+
+    def _schedule_next_idle_wander(self) -> float:
+        return time.time() + random.uniform(IDLE_WANDER_MIN_INTERVAL_S, IDLE_WANDER_MAX_INTERVAL_S)
 
     def run_forever(self, poll_hz: float = 10.0) -> None:
         period = 1.0 / poll_hz
@@ -60,6 +72,10 @@ class CharacterOrchestrator:
         elif not state.engaged and self._last_engaged:
             self._on_debug("DISENGAGE")
             self._on_disengage()
+        elif not state.engaged and time.time() >= self._next_idle_wander_at:
+            self._on_debug("idle wander")
+            self.executor.run(Action(kind="idle_sway", params={}))
+            self._next_idle_wander_at = self._schedule_next_idle_wander()
         self._last_engaged = state.engaged
         self._report_failures()
 
@@ -88,3 +104,6 @@ class CharacterOrchestrator:
             )
         )
         self.executor.run(Action(kind="home", params={}))
+        # Give it a moment to settle at home before wandering starts again,
+        # rather than immediately drifting off right as it returns.
+        self._next_idle_wander_at = self._schedule_next_idle_wander()
