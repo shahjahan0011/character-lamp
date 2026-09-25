@@ -1,0 +1,130 @@
+"""Turns Action messages into calls on the simulator.
+
+This is the model/body boundary in code: everything above this file (the
+character brain, any LLM/VLM) only ever produces `Action` objects from
+src.protocol.models. This file is the only place that knows how a named
+action maps to joint targets, light state, or a sound file -- the brain
+never sees a joint name.
+"""
+
+from __future__ import annotations
+
+import math
+import time
+from dataclasses import dataclass, field
+
+from src.protocol.models import Action, Telemetry
+
+from .sim import LampSimulator
+from .trajectory import DT, TrajectoryPlayer
+
+# look_at / point_at pan+tilt (radians) -> joint targets. Kept intentionally
+# simple: pan drives the base yaw, tilt splits between neck and head so the
+# motion reads as "the lamp orienting its head", not just spinning its base.
+def _look_targets(pan: float, tilt: float) -> dict[str, float]:
+    return {
+        "base_yaw_joint": _clip(pan, -2.45, 2.45),
+        "neck_yaw_joint": 0.0,
+        "head_pitch_joint": _clip(tilt, -0.8, 0.6),
+    }
+
+
+def _clip(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+HOME_POSE = {
+    "base_yaw_joint": 0.0,
+    "shoulder_pitch_joint": 0.0,
+    "elbow_pitch_joint": 0.0,
+    "neck_yaw_joint": 0.0,
+    "head_pitch_joint": 0.0,
+}
+
+NOD_POSE_DELTA = {"head_pitch_joint": 0.35}
+SHAKE_POSE_DELTA = {"neck_yaw_joint": 0.4}
+
+
+@dataclass
+class ExecutorHooks:
+    """Side effects the executor triggers that aren't simulator state --
+    wired up to real implementations later (speech/sfx modules); default to
+    no-ops so the body layer is independently testable."""
+
+    on_speak: callable = field(default=lambda text: None)
+    on_play_sound: callable = field(default=lambda name: None)
+    on_observe: callable = field(default=lambda: None)
+
+
+class ActionExecutor:
+    def __init__(self, sim: LampSimulator, hooks: ExecutorHooks | None = None):
+        self.sim = sim
+        self.player = TrajectoryPlayer(sim)
+        self.hooks = hooks or ExecutorHooks()
+        self._telemetry: list[Telemetry] = []
+
+    def run(self, action: Action, speed_scale: float = 1.0) -> None:
+        started = time.time()
+        self._telemetry.append(Telemetry(kind="action_started", payload={"kind": action.kind}))
+        try:
+            self._dispatch(action, speed_scale)
+        except Exception as exc:  # noqa: BLE001 -- log and keep the demo alive
+            self._telemetry.append(
+                Telemetry(kind="action_failed", payload={"kind": action.kind, "error": str(exc)})
+            )
+            return
+        self._telemetry.append(
+            Telemetry(
+                kind="action_done",
+                payload={"kind": action.kind, "elapsed_s": time.time() - started},
+            )
+        )
+
+    def _dispatch(self, action: Action, speed_scale: float) -> None:
+        p = action.params
+        if action.kind == "look_at":
+            self._move_and_settle(_look_targets(p.get("pan", 0.0), p.get("tilt", 0.0)), speed_scale)
+        elif action.kind == "point_at":
+            self._move_and_settle(_look_targets(p.get("pan", 0.0), p.get("tilt", 0.0)), speed_scale)
+        elif action.kind == "nod":
+            current = self.sim.get_all_joint_angles()
+            up = {"head_pitch_joint": current["head_pitch_joint"] + NOD_POSE_DELTA["head_pitch_joint"]}
+            self._move_and_settle(up, speed_scale=1.0)
+            self._move_and_settle({"head_pitch_joint": current["head_pitch_joint"]}, speed_scale=1.0)
+        elif action.kind == "shake_head":
+            current = self.sim.get_all_joint_angles()
+            base = current["neck_yaw_joint"]
+            for delta in (SHAKE_POSE_DELTA["neck_yaw_joint"], -SHAKE_POSE_DELTA["neck_yaw_joint"], 0.0):
+                self._move_and_settle({"neck_yaw_joint": base + delta}, speed_scale=1.0)
+        elif action.kind == "home":
+            self._move_and_settle(HOME_POSE, speed_scale)
+        elif action.kind == "idle_sway":
+            current = self.sim.get_all_joint_angles()
+            sway = math.radians(4)
+            self._move_and_settle({"base_yaw_joint": current["base_yaw_joint"] + sway}, speed_scale=0.3)
+            self._move_and_settle({"base_yaw_joint": current["base_yaw_joint"] - sway}, speed_scale=0.3)
+        elif action.kind == "set_light":
+            self.sim.set_light(
+                on=p.get("on", True),
+                color=tuple(p.get("color", (1.0, 0.95, 0.76))),
+                brightness=p.get("brightness", 1.0),
+            )
+        elif action.kind == "play_sound":
+            self.hooks.on_play_sound(p["name"])
+        elif action.kind == "speak":
+            self.hooks.on_speak(p["text"])
+        elif action.kind == "observe":
+            self.hooks.on_observe()
+        else:
+            raise ValueError(f"Unhandled action kind: {action.kind}")
+
+    def _move_and_settle(self, targets: dict[str, float], speed_scale: float) -> None:
+        self.player.move_to(targets, speed_scale=speed_scale)
+        while self.player.is_moving():
+            self.player.step(DT)
+            self.sim.forward()
+            time.sleep(DT)
+
+    def drain_telemetry(self) -> list[Telemetry]:
+        out, self._telemetry = self._telemetry, []
+        return out
