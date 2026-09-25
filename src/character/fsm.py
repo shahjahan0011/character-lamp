@@ -2,15 +2,20 @@
 
 Handles engagement (demo moments 1 and 2: notice someone, acknowledge them,
 dim back down when they leave) and spoken interaction (demo moment 3: only
-listens while engaged, transcribes, replies). Memory/goal states get added
+listens while engaged, understands, replies). Memory/goal states get added
 here later without changing how this part works -- it just reads whatever
-EngagementWatcher/SpeechCapture report and reacts.
+EngagementWatcher/SpeechCapture/DialogueWorker report and reacts.
 
 Deliberately not calling the LLM for the engagement *reaction* (see design
 discussion): it needs to feel instantaneous, and a network round-trip would
 undercut that, so the acknowledgment is a fixed, hardcoded Action sequence.
 The spoken reply, by contrast, has to go through the LLM -- there's no
-faking "understood what you said and answered it".
+faking "understood what you said and answered it". That round trip is slow
+(measured live: 30-60+ seconds combined), which is exactly why it runs on
+DialogueWorker's own background thread rather than inline here -- an
+earlier version blocked tick() directly on those calls, which froze
+engagement detection (confirmed live: disengage stopped working) for the
+entire wait.
 """
 
 from __future__ import annotations
@@ -20,10 +25,10 @@ import time
 from typing import Callable, Optional
 
 from src.body.executor import ActionExecutor
+from src.character.dialogue_worker import DialogueWorker
 from src.perception.engagement import EngagementWatcher
 from src.protocol.models import Action
 from src.speech.capture import SpeechCapture
-from src.speech import dialogue, stt
 
 MAX_PAN_RAD = 0.7  # radians; matches base_yaw_joint's usable range for a look
 
@@ -32,9 +37,9 @@ NOTICE_FLASH_COUNT = 2
 NOTICE_FLASH_INTERVAL_S = 0.12
 IDLE_BRIGHTNESS = 0.2
 ENGAGED_BRIGHTNESS = 1.0
-# Free-tier Gemini audio calls are genuinely slow (measured live: STT
-# ~34s, TTS ~16s) -- a cool, dim, distinct color while processing so the
-# 30-50s round trip reads as "thinking", not "frozen/broken".
+# Free-tier Gemini audio calls are genuinely slow (measured live: 30-60+
+# seconds combined) -- a cool, dim, distinct color while processing so the
+# wait reads as "thinking", not "frozen/broken".
 THINKING_COLOR = [0.55, 0.7, 1.0]
 THINKING_BRIGHTNESS = 0.45
 
@@ -52,17 +57,21 @@ class CharacterOrchestrator:
         executor: ActionExecutor,
         watcher: EngagementWatcher,
         speech: Optional[SpeechCapture] = None,
+        dialogue_worker: Optional[DialogueWorker] = None,
         on_debug: Optional[Callable[[str], None]] = None,
     ):
         self.executor = executor
         self.watcher = watcher
         self.speech = speech
-        self._last_engaged = False
         # Optional hook for tests/scripts to print what's happening -- the
         # executor swallows action exceptions into telemetry by design (one
         # bad action shouldn't kill the demo), which otherwise means a
         # failure looks identical to "nothing happened". This surfaces it.
         self._on_debug = on_debug or (lambda msg: None)
+        self.dialogue_worker = dialogue_worker or (
+            DialogueWorker(on_debug=self._on_debug) if speech is not None else None
+        )
+        self._last_engaged = False
         self._next_idle_wander_at = self._schedule_next_idle_wander()
         # Starts disengaged, so the idle music starts playing immediately.
         self.executor.run(Action(kind="music_on", params={}))
@@ -83,8 +92,8 @@ class CharacterOrchestrator:
     def tick(self) -> None:
         """Check the current engagement state once and react to a
         just-happened transition. Exposed separately from run_forever so
-        tests (and later, a bigger orchestrator loop covering speech/goals)
-        can call it directly instead of only via a blocking loop."""
+        tests (and later, a bigger orchestrator loop covering goals) can
+        call it directly instead of only via a blocking loop."""
         state = self.watcher.get_state()
         if state.engaged and not self._last_engaged:
             self._on_debug(f"ENGAGE face_x_frac={state.face_x_frac:.2f}")
@@ -99,38 +108,51 @@ class CharacterOrchestrator:
         elif state.engaged and self.speech is not None:
             self._check_speech()
         self._last_engaged = state.engaged
+        # Checked every tick regardless of the branch above -- a reply can
+        # become ready at any moment, independent of whatever else is
+        # happening (including a disengage that happened while it was
+        # still in flight; see _check_dialogue_reply).
+        self._check_dialogue_reply(state.engaged)
         self._report_failures()
 
     def _check_speech(self) -> None:
+        if self.dialogue_worker is None:
+            return
         utterance = self.speech.get_pending_utterance()
         if utterance is None:
             return
-        self._on_debug(f"heard {utterance.duration_s:.1f}s of speech, transcribing...")
-        self.executor.run(
-            Action(kind="set_light", params={"on": True, "color": THINKING_COLOR, "brightness": THINKING_BRIGHTNESS})
-        )
-        try:
-            transcript = stt.transcribe(utterance.wav_bytes)
-        except Exception as exc:  # noqa: BLE001 -- one bad STT call shouldn't kill the demo
-            self._on_debug(f"STT FAILED: {exc}")
-            self._restore_engaged_light()
+        if self.dialogue_worker.submit(utterance):
+            self.executor.run(
+                Action(
+                    kind="set_light",
+                    params={"on": True, "color": THINKING_COLOR, "brightness": THINKING_BRIGHTNESS},
+                )
+            )
+
+    def _check_dialogue_reply(self, currently_engaged: bool) -> None:
+        if self.dialogue_worker is None:
             return
-        if not transcript:
-            self._on_debug("(transcript empty -- likely no speech in that clip)")
-            self._restore_engaged_light()
+        reply = self.dialogue_worker.get_ready_reply()
+        if reply is None:
             return
-        self._on_debug(f'  transcript: "{transcript}"')
-        try:
-            result = dialogue.respond(transcript)
-        except Exception as exc:  # noqa: BLE001
-            self._on_debug(f"DIALOGUE FAILED: {exc}")
-            self._restore_engaged_light()
+        if not currently_engaged:
+            # Disengaged while the reply was still in flight -- don't have
+            # it speak into an empty room once it finally arrives.
+            self._on_debug(f'(reply ready but no longer engaged, dropping: "{reply.reply}")')
             return
-        self._on_debug(f'  reply: "{result.reply}" (gesture={result.gesture})')
         self._restore_engaged_light()
-        if result.gesture != "none":
-            self.executor.run(Action(kind=result.gesture, params={}))
-        self.executor.run(Action(kind="speak", params={"text": result.reply}))
+        if reply.gesture != "none":
+            self.executor.run(Action(kind=reply.gesture, params={}))
+        self._speak_synthesized(reply.audio_bytes)
+
+    def _speak_synthesized(self, audio_bytes: bytes) -> None:
+        """Plays audio already synthesized by DialogueWorker -- deliberately
+        bypasses the speak Action/on_speak hook, which would call Gemini's
+        TTS *again* (another ~15s network call) for audio we already have."""
+        try:
+            self.executor.hooks.on_speak_audio(audio_bytes)
+        except Exception as exc:  # noqa: BLE001
+            self._on_debug(f"PLAYBACK FAILED: {exc}")
 
     def _restore_engaged_light(self) -> None:
         self.executor.run(

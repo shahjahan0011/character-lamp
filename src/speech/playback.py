@@ -123,4 +123,5 @@ def make_audio_hooks(music_volume: float = 0.5, speak: bool = True) -> dict:
 
         hooks["on_speak"] = on_speak
 
+    hooks["on_speak_audio"] = play_bytes
     return hooks
