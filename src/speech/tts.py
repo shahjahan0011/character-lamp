@@ -14,7 +14,7 @@ from .gemini_client import TTS_MODEL, get_client
 DEFAULT_VOICE = "Kore"
 
 
-def synthesize(text: str, voice: str = DEFAULT_VOICE) -> bytes:
+def synthesize(text: str, voice: str = DEFAULT_VOICE, timeout_s: float = 45.0) -> bytes:
     client = get_client()
     interaction = client.interactions.create(
         model=TTS_MODEL,
@@ -26,5 +26,6 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE) -> bytes:
         ],
         response_format={"type": "audio"},
         generation_config={"speech_config": [{"voice": voice}]},
+        timeout=timeout_s,
     )
     return base64.b64decode(interaction.output_audio.data)

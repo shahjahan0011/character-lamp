@@ -32,6 +32,11 @@ NOTICE_FLASH_COUNT = 2
 NOTICE_FLASH_INTERVAL_S = 0.12
 IDLE_BRIGHTNESS = 0.2
 ENGAGED_BRIGHTNESS = 1.0
+# Free-tier Gemini audio calls are genuinely slow (measured live: STT
+# ~34s, TTS ~16s) -- a cool, dim, distinct color while processing so the
+# 30-50s round trip reads as "thinking", not "frozen/broken".
+THINKING_COLOR = [0.55, 0.7, 1.0]
+THINKING_BRIGHTNESS = 0.45
 
 # While nobody's engaged, the lamp wanders on its own every so often --
 # otherwise it just sits frozen, which reads as "off" rather than "alive but
@@ -101,22 +106,36 @@ class CharacterOrchestrator:
         if utterance is None:
             return
         self._on_debug(f"heard {utterance.duration_s:.1f}s of speech, transcribing...")
+        self.executor.run(
+            Action(kind="set_light", params={"on": True, "color": THINKING_COLOR, "brightness": THINKING_BRIGHTNESS})
+        )
         try:
             transcript = stt.transcribe(utterance.wav_bytes)
         except Exception as exc:  # noqa: BLE001 -- one bad STT call shouldn't kill the demo
             self._on_debug(f"STT FAILED: {exc}")
+            self._restore_engaged_light()
             return
         if not transcript:
             self._on_debug("(transcript empty -- likely no speech in that clip)")
+            self._restore_engaged_light()
             return
         self._on_debug(f'  transcript: "{transcript}"')
         try:
-            reply = dialogue.respond(transcript)
+            result = dialogue.respond(transcript)
         except Exception as exc:  # noqa: BLE001
             self._on_debug(f"DIALOGUE FAILED: {exc}")
+            self._restore_engaged_light()
             return
-        self._on_debug(f'  reply: "{reply}"')
-        self.executor.run(Action(kind="speak", params={"text": reply}))
+        self._on_debug(f'  reply: "{result.reply}" (gesture={result.gesture})')
+        self._restore_engaged_light()
+        if result.gesture != "none":
+            self.executor.run(Action(kind=result.gesture, params={}))
+        self.executor.run(Action(kind="speak", params={"text": result.reply}))
+
+    def _restore_engaged_light(self) -> None:
+        self.executor.run(
+            Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": ENGAGED_BRIGHTNESS})
+        )
 
     def _report_failures(self) -> None:
         for t in self.executor.drain_telemetry():

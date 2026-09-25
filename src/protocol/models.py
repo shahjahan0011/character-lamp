@@ -21,6 +21,8 @@ ActionKind = Literal[
     "point_at",     # params: pan (rad), tilt (rad) -- aim head/arm at a direction
     "nod",          # params: {} -- short acknowledgement gesture
     "shake_head",   # params: {} -- short "no" gesture
+    "excited",      # params: {} -- enthusiastic bounce + brief bright flash
+    "curious",      # params: {} -- head tilt, held briefly
     "set_light",    # params: on (bool), color ([r,g,b] 0-1), brightness (0-1)
     "play_sound",   # params: name (str) -- file under assets/sfx or assets/music
     "music_on",     # params: {} -- start the idle background music loop

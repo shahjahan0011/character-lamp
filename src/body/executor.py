@@ -78,6 +78,12 @@ HOME_POSE = {
 
 NOD_POSE_DELTA = {"head_pitch_joint": 0.35}
 SHAKE_POSE_DELTA = {"neck_yaw_joint": 0.4}
+EXCITED_HEAD_BOUNCE = 0.2
+EXCITED_BASE_WIGGLE = 0.15
+EXCITED_FLASH_COLOR = (1.0, 0.75, 0.3)
+CURIOUS_NECK_TILT = 0.35
+CURIOUS_HEAD_TILT = -0.15
+CURIOUS_HOLD_S = 0.4
 
 # Idle wandering (nobody engaged): gentle, curious-looking drift, not the
 # alert "attentive" lean used for look_at -- the two poses should read as
@@ -143,6 +149,25 @@ class ActionExecutor:
             base = current["neck_yaw_joint"]
             for delta in (SHAKE_POSE_DELTA["neck_yaw_joint"], -SHAKE_POSE_DELTA["neck_yaw_joint"], 0.0):
                 self._move_and_settle({"neck_yaw_joint": base + delta}, speed_scale=1.0)
+        elif action.kind == "excited":
+            current = self.sim.get_all_joint_angles()
+            base, head = current["base_yaw_joint"], current["head_pitch_joint"]
+            for _ in range(2):
+                self._move_and_settle(
+                    {"head_pitch_joint": head - EXCITED_HEAD_BOUNCE, "base_yaw_joint": base + EXCITED_BASE_WIGGLE},
+                    speed_scale=1.0,
+                )
+                self._move_and_settle({"head_pitch_joint": head, "base_yaw_joint": base}, speed_scale=1.0)
+            self.sim.set_light(on=True, color=EXCITED_FLASH_COLOR, brightness=1.0)
+        elif action.kind == "curious":
+            current = self.sim.get_all_joint_angles()
+            neck, head = current["neck_yaw_joint"], current["head_pitch_joint"]
+            self._move_and_settle(
+                {"neck_yaw_joint": neck + CURIOUS_NECK_TILT, "head_pitch_joint": head + CURIOUS_HEAD_TILT},
+                speed_scale=0.5,
+            )
+            time.sleep(CURIOUS_HOLD_S)
+            self._move_and_settle({"neck_yaw_joint": neck, "head_pitch_joint": head}, speed_scale=0.5)
         elif action.kind == "home":
             self._move_and_settle(HOME_POSE, speed_scale)
         elif action.kind == "idle_sway":
