@@ -18,12 +18,25 @@ from src.protocol.models import Action, Telemetry
 from .sim import LampSimulator
 from .trajectory import DT, TrajectoryPlayer
 
-# look_at / point_at pan+tilt (radians) -> joint targets. Kept intentionally
-# simple: pan drives the base yaw, tilt splits between neck and head so the
-# motion reads as "the lamp orienting its head", not just spinning its base.
+# At all-zero joint angles the arm is fully extended straight up (each
+# segment's local frame stacks with no bend), which does not read as "a lamp
+# looking at you" no matter which way the base turns -- the head just spins
+# around while still pointing at the ceiling. A real desk lamp leans its arm
+# down toward what it's looking at, so "looking" bends the shoulder/elbow
+# into a leaning-forward pose (matches the pose we validated visually
+# earlier), not just the base and head.
+ATTENTIVE_SHOULDER_PITCH = 0.7
+ATTENTIVE_ELBOW_PITCH = -1.2
+
+
+# look_at / point_at pan+tilt (radians) -> joint targets. pan drives the base
+# yaw (left/right), tilt fine-tunes head pitch (up/down) on top of the
+# leaning-forward attentive pose above.
 def _look_targets(pan: float, tilt: float) -> dict[str, float]:
     return {
         "base_yaw_joint": _clip(pan, -2.45, 2.45),
+        "shoulder_pitch_joint": ATTENTIVE_SHOULDER_PITCH,
+        "elbow_pitch_joint": ATTENTIVE_ELBOW_PITCH,
         "neck_yaw_joint": 0.0,
         "head_pitch_joint": _clip(tilt, -0.8, 0.6),
     }
