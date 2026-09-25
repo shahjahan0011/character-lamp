@@ -160,18 +160,28 @@ class CharacterOrchestrator:
         reply = self.dialogue_worker.get_ready_reply()
         if reply is None:
             return
-        if not currently_engaged:
-            # Disengaged while the reply was still in flight -- don't have
-            # it speak into an empty room once it finally arrives.
-            self._on_debug(f'(reply ready but no longer engaged, dropping: "{reply.reply}")')
-            return
-        self._restore_engaged_light()
+        # Answer even if they've since looked away -- they asked a real
+        # question and still want it answered, even if they're not looking
+        # at the lamp right this second. Brighten briefly to deliver it,
+        # then dim back to idle afterward rather than staying lit as if
+        # still engaged.
+        if currently_engaged:
+            self._restore_engaged_light()
+        else:
+            self._on_debug(f'(delivering delayed reply after disengage: "{reply.reply}")')
+            self.executor.run(
+                Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": ENGAGED_BRIGHTNESS})
+            )
         # Start the audio playing first (non-blocking -- see on_speak_audio),
         # *then* run the gesture, so the gesture happens while it's actually
         # talking instead of before or after.
         self._speak_synthesized(reply.audio_bytes)
         if reply.gesture != "none":
             self.executor.run(Action(kind=reply.gesture, params={}))
+        if not currently_engaged:
+            self.executor.run(
+                Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": IDLE_BRIGHTNESS})
+            )
 
     def _on_error(self) -> None:
         self.executor.run(Action(kind="shake_head", params={}))
