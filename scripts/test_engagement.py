@@ -26,7 +26,7 @@ def main() -> None:
     watcher.start()
     print("Watching. Look at your webcam to engage the lamp; look away to disengage.")
 
-    orchestrator = CharacterOrchestrator(executor, watcher)
+    orchestrator = CharacterOrchestrator(executor, watcher, on_debug=print)
     try:
         orchestrator.run_forever(poll_hz=10.0)
     finally:
