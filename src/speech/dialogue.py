@@ -24,13 +24,17 @@ response, parsed with a regex. Less elegant, but it's predictable extra
 lines in a call we already know works, rather than a new API shape to get
 subtly wrong under time pressure.
 
-Free-tier latency is genuinely variable, not just slow: one measured call
-succeeded in 23.1s, another timed out entirely at 60s in the same
-session. timeout_s is set well above the fast case specifically to
-tolerate that variance rather than chase a "correct" number that doesn't
-exist -- a slow-but-successful call is much better than a needlessly
-aborted one. DialogueWorker still surfaces a real timeout as a visible
-"something went wrong" cue rather than silence; see its _failed flag.
+Requests stream=True. Measured live: the same call, non-streaming vs.
+streaming, was 23-60+s vs. 7.87s -- not a small tweak, apparently a
+genuinely different and much faster server-side code path, even though
+in practice it still arrives as 1-2 text deltas rather than many
+incremental ones. Combined with tts.py's streaming (16s -> 3.8s), total
+round-trip latency drops from 40-90s+ down to roughly 12-15s. timeout_s
+is still set with real margin above the fast case -- free-tier latency
+is variable, not just slow, and a slow-but-successful call beats a
+needlessly aborted one. DialogueWorker surfaces a real timeout as a
+visible "something went wrong" cue rather than silence; see its _failed
+flag.
 """
 
 from __future__ import annotations
@@ -122,19 +126,29 @@ def _parse_audio(raw: str) -> AudioDialogueResponse:
     )
 
 
+def _collect_text_stream(stream) -> str:
+    chunks: list[str] = []
+    for event in stream:
+        delta = getattr(event, "delta", None)
+        if delta is not None and getattr(delta, "type", None) == "text":
+            chunks.append(delta.text or "")
+    return "".join(chunks)
+
+
 def respond(transcript: str, timeout_s: float = 30.0) -> DialogueResponse:
     client = get_client()
-    interaction = client.interactions.create(
+    stream = client.interactions.create(
         model=TEXT_MODEL,
         input=[{"type": "text", "text": f'{PERSONA}\n\nThey said: "{transcript}"'}],
+        stream=True,
         timeout=timeout_s,
     )
-    return _parse(interaction.output_text or "")
+    return _parse(_collect_text_stream(stream))
 
 
-def respond_to_audio(wav_bytes: bytes, timeout_s: float = 100.0) -> AudioDialogueResponse:
+def respond_to_audio(wav_bytes: bytes, timeout_s: float = 45.0) -> AudioDialogueResponse:
     client = get_client()
-    interaction = client.interactions.create(
+    stream = client.interactions.create(
         model=TEXT_MODEL,
         input=[
             {"type": "text", "text": AUDIO_PERSONA},
@@ -144,6 +158,7 @@ def respond_to_audio(wav_bytes: bytes, timeout_s: float = 100.0) -> AudioDialogu
                 "mime_type": "audio/wav",
             },
         ],
+        stream=True,
         timeout=timeout_s,
     )
-    return _parse_audio(interaction.output_text or "")
+    return _parse_audio(_collect_text_stream(stream))
