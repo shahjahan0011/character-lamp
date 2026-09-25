@@ -223,5 +223,13 @@ class LampSimulator:
         advance. Kept so trajectory.py/executor.py don't need to know which
         physics engine is underneath."""
 
+    def is_connected(self) -> bool:
+        """False once the GUI window has been closed (or DIRECT-mode
+        connection otherwise torn down). Callers running a long-lived loop
+        should check this and exit rather than keep calling into a dead
+        physics client -- see CharacterOrchestrator.run_forever."""
+        return bool(p.isConnected(physicsClientId=self._client))
+
     def close(self) -> None:
-        p.disconnect(physicsClientId=self._client)
+        if self.is_connected():
+            p.disconnect(physicsClientId=self._client)
