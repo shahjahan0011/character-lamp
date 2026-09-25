@@ -21,7 +21,9 @@ import collections
 import io
 import threading
 import time
+import traceback
 from dataclasses import dataclass
+from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -53,7 +55,15 @@ class SpeechCapture:
         silence_ms_to_end: int = 700,
         min_utterance_ms: int = 300,
         padding_ms: int = 300,
+        on_debug: Optional[Callable[[str], None]] = None,
     ):
+        # A crash in the background capture thread would otherwise be
+        # silent (daemon thread, nothing polls its liveness) -- exactly
+        # "it can't hear me" with no visible cause. This surfaces both
+        # thread errors and a periodic mic-level readout so it's possible
+        # to tell "no audio is reaching us" apart from "audio is arriving
+        # but the VAD isn't calling it speech" apart from "the thread died".
+        self._on_debug = on_debug or (lambda msg: None)
         self._vad = webrtcvad.Vad(vad_aggressiveness)
         self._ring_size = max(1, padding_ms // FRAME_MS)
         self._silence_frames_to_end = max(1, silence_ms_to_end // FRAME_MS)
@@ -123,6 +133,9 @@ class SpeechCapture:
         ring_buffer: collections.deque = collections.deque(maxlen=self._ring_size)
         triggered = False
         voiced_frames: list[bytes] = []
+        last_level_log = 0.0
+        frames_since_log = 0
+        voiced_since_log = 0
 
         while self._running:
             if not self._active.is_set():
@@ -138,29 +151,62 @@ class SpeechCapture:
                 time.sleep(0.01)
                 continue
 
-            for frame in frames:
-                is_speech = self._vad.is_speech(frame, SAMPLE_RATE)
-                if not triggered:
-                    ring_buffer.append((frame, is_speech))
-                    voiced_count = sum(1 for _, s in ring_buffer if s)
-                    if voiced_count > 0.5 * ring_buffer.maxlen:
-                        triggered = True
-                        voiced_frames = [f for f, _ in ring_buffer]
-                        ring_buffer.clear()
-                else:
-                    voiced_frames.append(frame)
-                    ring_buffer.append((frame, is_speech))
-                    unvoiced_count = sum(1 for _, s in ring_buffer if not s)
-                    if unvoiced_count >= self._silence_frames_to_end:
-                        if len(voiced_frames) >= self._min_speech_frames:
-                            self._finish_utterance(voiced_frames)
-                        triggered = False
-                        voiced_frames = []
-                        ring_buffer.clear()
+            try:
+                for frame in frames:
+                    if len(frame) != FRAME_SAMPLES * 2:  # 2 bytes/sample (int16)
+                        # webrtcvad requires an exact 10/20/30ms frame; a
+                        # malformed one would otherwise raise and silently
+                        # kill this whole thread (nothing else polls it).
+                        self._on_debug(
+                            f"speech capture: dropping malformed frame "
+                            f"({len(frame)} bytes, expected {FRAME_SAMPLES * 2})"
+                        )
+                        continue
+
+                    is_speech = self._vad.is_speech(frame, SAMPLE_RATE)
+                    frames_since_log += 1
+                    voiced_since_log += int(is_speech)
+                    rms = np.sqrt(np.mean(np.frombuffer(frame, dtype=np.int16).astype(np.float32) ** 2))
+                    now = time.time()
+                    if now - last_level_log > 2.0:
+                        self._on_debug(
+                            f"speech capture: mic level rms={rms:.0f} "
+                            f"({voiced_since_log}/{frames_since_log} frames flagged as speech)"
+                        )
+                        last_level_log = now
+                        frames_since_log = 0
+                        voiced_since_log = 0
+
+                    if not triggered:
+                        ring_buffer.append((frame, is_speech))
+                        voiced_count = sum(1 for _, s in ring_buffer if s)
+                        if voiced_count > 0.5 * ring_buffer.maxlen:
+                            triggered = True
+                            voiced_frames = [f for f, _ in ring_buffer]
+                            ring_buffer.clear()
+                            self._on_debug("speech capture: speech started")
+                    else:
+                        voiced_frames.append(frame)
+                        ring_buffer.append((frame, is_speech))
+                        unvoiced_count = sum(1 for _, s in ring_buffer if not s)
+                        if unvoiced_count >= self._silence_frames_to_end:
+                            if len(voiced_frames) >= self._min_speech_frames:
+                                self._finish_utterance(voiced_frames)
+                            else:
+                                self._on_debug("speech capture: too short, discarding")
+                            triggered = False
+                            voiced_frames = []
+                            ring_buffer.clear()
+            except Exception:  # noqa: BLE001 -- keep the capture thread alive
+                self._on_debug(f"speech capture thread error:\n{traceback.format_exc()}")
+                triggered = False
+                voiced_frames = []
+                ring_buffer.clear()
 
     def _finish_utterance(self, voiced_frames: list[bytes]) -> None:
         pcm_bytes = b"".join(voiced_frames)
         wav_bytes = _pcm16_to_wav_bytes(pcm_bytes)
         duration_s = len(voiced_frames) * FRAME_MS / 1000.0
+        self._on_debug(f"speech capture: utterance finished ({duration_s:.1f}s)")
         with self._utterance_lock:
             self._pending_utterance = Utterance(wav_bytes=wav_bytes, duration_s=duration_s)
