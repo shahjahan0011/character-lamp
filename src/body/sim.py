@@ -68,7 +68,7 @@ class LampSimulator:
         if gui:
             p.resetDebugVisualizerCamera(
                 cameraDistance=1.8,
-                cameraYaw=35,
+                cameraYaw=270,
                 cameraPitch=-15,
                 cameraTargetPosition=[0, 0, 0.3],
                 physicsClientId=self._client,
@@ -202,14 +202,23 @@ class LampSimulator:
         width: int = 640,
         height: int = 480,
         distance: float = 1.8,
-        yaw: float = 35,
+        yaw: float = 270,
         pitch: float = -15,
         target: tuple[float, float, float] = (0.0, 0.0, 0.3),
     ):
         """Headless RGB render (works identically with or without a GUI
         window -- used both for demo screenshots and for the eventual
         Ubuntu deployment, which has no guaranteed display). Defaults match
-        the GUI debug camera set in __init__."""
+        the GUI debug camera set in __init__.
+
+        yaw=270 is not arbitrary: it's the azimuth, found empirically (by
+        rendering across the full 0-360 range and scoring which one sees
+        the lit shade opening), that matches where the attentive pose in
+        executor.py actually faces. Earlier attempts had this backwards --
+        contorting the robot's pose to face a camera angle picked first --
+        which is what produced an unnaturally twisted-neck look. The camera
+        should look at wherever the lamp naturally faces, not the other way
+        around."""
         view = p.computeViewMatrixFromYawPitchRoll(
             cameraTargetPosition=list(target),
             distance=distance,
