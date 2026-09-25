@@ -8,3 +8,9 @@ logs/
 *.egg-info/
 .pytest_cache/
 scratch_renders/
+
+# Reference/demo images - never push these
+*.png
+*.jpg
+*.jpeg
+!robot/assets/**

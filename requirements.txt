@@ -1,4 +1,8 @@
-mujoco>=3.2
+# Pinned to Python 3.11 (see .python-version): pybullet ships prebuilt
+# manylinux wheels for cp310/cp311 but not cp312, which is Ubuntu 24.04's
+# default python3. On macOS there are no prebuilt wheels at all regardless
+# of version -- see scripts/install_pybullet_macos.sh.
+pybullet>=3.2.6
 pydantic>=2.6
 numpy>=1.26
 opencv-python>=4.9
