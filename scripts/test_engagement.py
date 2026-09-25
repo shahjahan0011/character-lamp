@@ -40,7 +40,7 @@ def main() -> None:
     sim = LampSimulator(gui=True, clean_gui=True)
     executor = ActionExecutor(sim, hooks=ExecutorHooks(**make_audio_hooks(speak=has_key)))
     watcher = EngagementWatcher()
-    speech = SpeechCapture()
+    speech = SpeechCapture(on_debug=print)
 
     print("Starting camera and microphone...")
     watcher.start()
