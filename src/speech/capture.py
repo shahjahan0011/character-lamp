@@ -46,7 +46,18 @@ GRACE_PERIOD_S = 1.5
 
 
 def _pcm16_to_wav_bytes(pcm_bytes: bytes) -> bytes:
-    audio = np.frombuffer(pcm_bytes, dtype=np.int16)
+    audio = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32)
+    # Observed live: laptop-mic recordings peaking around rms 4-9 (vs.
+    # ~1000+ typical for normal speaking volume into a real mic) -- a WAV
+    # that quiet transcribes poorly regardless of how well it's segmented.
+    # Normalize toward a healthy peak, capping the gain so near-total
+    # silence (no real signal at all) doesn't just get amplified into loud
+    # noise.
+    peak = np.abs(audio).max()
+    if peak > 0:
+        gain = min(32767 * 0.9 / peak, 20.0)
+        audio = audio * gain
+    audio = np.clip(audio, -32768, 32767).astype(np.int16)
     buf = io.BytesIO()
     sf.write(buf, audio, SAMPLE_RATE, format="WAV", subtype="PCM_16")
     return buf.getvalue()
@@ -144,9 +155,21 @@ class SpeechCapture:
             self._pending_frames.append(bytes(indata))
 
     def _run(self) -> None:
+        # Pre-trigger ring buffer only: a short rolling window used solely to
+        # detect when speech *starts* (and to grab a bit of pre-roll audio
+        # once it does). It must stay small (padding_ms). Detecting when
+        # speech *ends* needs a separate, unbounded consecutive-frame
+        # counter -- reusing this same small buffer for that (an earlier
+        # version of this code did) makes "unvoiced_count >= silence_frames_
+        # to_end" impossible to ever satisfy whenever silence_ms_to_end is
+        # longer than padding_ms, since the buffer can never hold more than
+        # its maxlen. Confirmed via a live test: full seconds of measured
+        # silence (0/67 frames flagged as speech) still never ended the
+        # utterance.
         ring_buffer: collections.deque = collections.deque(maxlen=self._ring_size)
         triggered = False
         voiced_frames: list[bytes] = []
+        consecutive_unvoiced = 0
         last_level_log = 0.0
         frames_since_log = 0
         voiced_since_log = 0
@@ -157,6 +180,7 @@ class SpeechCapture:
                     self._on_debug("speech capture: grace period expired mid-utterance, discarding")
                 triggered = False
                 voiced_frames = []
+                consecutive_unvoiced = 0
                 ring_buffer.clear()
                 with self._capture_lock:
                     self._pending_frames = []
@@ -202,23 +226,28 @@ class SpeechCapture:
                             triggered = True
                             voiced_frames = [f for f, _ in ring_buffer]
                             ring_buffer.clear()
+                            consecutive_unvoiced = 0
                             self._on_debug("speech capture: speech started")
                     else:
                         voiced_frames.append(frame)
-                        ring_buffer.append((frame, is_speech))
-                        unvoiced_count = sum(1 for _, s in ring_buffer if not s)
-                        if unvoiced_count >= self._silence_frames_to_end:
-                            if len(voiced_frames) >= self._min_speech_frames:
-                                self._finish_utterance(voiced_frames)
+                        consecutive_unvoiced = 0 if is_speech else consecutive_unvoiced + 1
+                        if consecutive_unvoiced >= self._silence_frames_to_end:
+                            # Trim the trailing silence itself off before
+                            # finishing -- it's not part of what was said.
+                            spoken_frames = voiced_frames[: -self._silence_frames_to_end]
+                            if len(spoken_frames) >= self._min_speech_frames:
+                                self._finish_utterance(spoken_frames)
                             else:
                                 self._on_debug("speech capture: too short, discarding")
                             triggered = False
                             voiced_frames = []
+                            consecutive_unvoiced = 0
                             ring_buffer.clear()
             except Exception:  # noqa: BLE001 -- keep the capture thread alive
                 self._on_debug(f"speech capture thread error:\n{traceback.format_exc()}")
                 triggered = False
                 voiced_frames = []
+                consecutive_unvoiced = 0
                 ring_buffer.clear()
 
     def _finish_utterance(self, voiced_frames: list[bytes]) -> None:
