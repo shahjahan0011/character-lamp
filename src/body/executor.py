@@ -99,6 +99,8 @@ class ExecutorHooks:
     on_speak: callable = field(default=lambda text: None)
     on_play_sound: callable = field(default=lambda name: None)
     on_observe: callable = field(default=lambda: None)
+    on_music_on: callable = field(default=lambda: None)
+    on_music_off: callable = field(default=lambda: None)
 
 
 class ActionExecutor:
@@ -160,6 +162,10 @@ class ActionExecutor:
             )
         elif action.kind == "play_sound":
             self.hooks.on_play_sound(p["name"])
+        elif action.kind == "music_on":
+            self.hooks.on_music_on()
+        elif action.kind == "music_off":
+            self.hooks.on_music_off()
         elif action.kind == "speak":
             self.hooks.on_speak(p["text"])
         elif action.kind == "observe":
