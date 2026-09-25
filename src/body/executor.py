@@ -9,7 +9,7 @@ never sees a joint name.
 
 from __future__ import annotations
 
-import math
+import random
 import time
 from dataclasses import dataclass, field
 
@@ -63,6 +63,16 @@ HOME_POSE = {
 
 NOD_POSE_DELTA = {"head_pitch_joint": 0.35}
 SHAKE_POSE_DELTA = {"neck_yaw_joint": 0.4}
+
+# Idle wandering (nobody engaged): gentle, curious-looking drift, not the
+# alert "attentive" lean used for look_at -- the two poses should read as
+# different moods. Ranges stay comfortably inside each joint's soft limits.
+IDLE_BASE_YAW_RANGE = (-1.2, 1.2)
+IDLE_SHOULDER_RANGE = (-0.3, 0.4)
+IDLE_ELBOW_RANGE = (-1.2, -0.3)
+IDLE_NECK_YAW_RANGE = (-0.6, 0.6)
+IDLE_HEAD_PITCH_RANGE = (-0.3, 0.2)
+IDLE_SPEED_SCALE = 0.35  # slower than a reflex -- idle drift, not a reaction
 
 
 @dataclass
@@ -119,10 +129,14 @@ class ActionExecutor:
         elif action.kind == "home":
             self._move_and_settle(HOME_POSE, speed_scale)
         elif action.kind == "idle_sway":
-            current = self.sim.get_all_joint_angles()
-            sway = math.radians(4)
-            self._move_and_settle({"base_yaw_joint": current["base_yaw_joint"] + sway}, speed_scale=0.3)
-            self._move_and_settle({"base_yaw_joint": current["base_yaw_joint"] - sway}, speed_scale=0.3)
+            targets = {
+                "base_yaw_joint": random.uniform(*IDLE_BASE_YAW_RANGE),
+                "shoulder_pitch_joint": random.uniform(*IDLE_SHOULDER_RANGE),
+                "elbow_pitch_joint": random.uniform(*IDLE_ELBOW_RANGE),
+                "neck_yaw_joint": random.uniform(*IDLE_NECK_YAW_RANGE),
+                "head_pitch_joint": random.uniform(*IDLE_HEAD_PITCH_RANGE),
+            }
+            self._move_and_settle(targets, speed_scale=IDLE_SPEED_SCALE)
         elif action.kind == "set_light":
             self.sim.set_light(
                 on=p.get("on", True),
