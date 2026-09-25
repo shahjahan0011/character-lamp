@@ -22,37 +22,44 @@ from .trajectory import DT, TrajectoryPlayer
 # segment's local frame stacks with no bend), which does not read as "a lamp
 # looking at you" no matter which way the base turns -- the head just spins
 # around while still pointing at the ceiling. A real desk lamp leans its arm
-# down toward what it's looking at, so "looking" bends the shoulder/elbow/
-# neck into a pose that faces the shade opening at the viewer.
+# down toward what it's looking at, so "looking" bends the shoulder/elbow
+# into a gentle forward pose that faces the shade opening at the viewer.
 #
-# These specific values were not guessed. Two rounds of empirical, verified
-# search (see git history for the sweep scripts):
-#   1. Swept shoulder/elbow with the light on to find any combination where
-#      the lit opening actually faces the camera, rather than eyeballing a
-#      silhouette (an earlier attempt, 0.7/-1.2, looked like a reasonable
-#      lean but was pure side profile -- the opening never faced forward).
-#   2. That first working combination (-0.6/-1.7) turned out to bend the
-#      head down to world Z=0.005 -- level with the floor, clipping through
-#      it, which the sweep's camera angle didn't happen to reveal. Re-swept
-#      gentler shoulder/elbow leans combined with neck_yaw (which reorients
-#      the head without dragging the whole arm down) and checked world-Z
-#      height alongside the visual check this time. This combination keeps
-#      the head above Z=0.55 across the full pan/tilt range while still
-#      facing the opening at the viewer.
-ATTENTIVE_SHOULDER_PITCH = 0.2
-ATTENTIVE_ELBOW_PITCH = -0.9
-ATTENTIVE_NECK_YAW = 1.0
+# History, because this took three tries and each one taught something:
+#   1. shoulder=0.7/elbow=-1.2 looked like a reasonable lean in a single
+#      screenshot, but the shade's opening was never actually checked --
+#      it was pure side profile, never facing forward at all.
+#   2. shoulder=-0.6/elbow=-1.7 (found by sweeping with the light on, so
+#      the opening's direction was actually verified) bent the head down
+#      to world Z=0.005 -- level with the floor, clipping through it.
+#   3. shoulder=0.2/elbow=-0.9/neck_yaw=1.0 fixed both of those (checked
+#      height AND facing this time), but neck_yaw is literally "swivel the
+#      head sideways relative to the arm" -- it looked like glancing over
+#      one's shoulder, not looking straight at someone. Wrong joint for
+#      the job even though it scored well numerically.
+#
+# The actual fix: stop picking a camera angle first and then contorting the
+# robot to face it. Instead, pick a natural, gentle pose with neck_yaw=0
+# (no twist), then point the camera at wherever *that* pose actually faces
+# -- found by rendering across the full 360-degree yaw range and scoring
+# which angle sees the lit shade opening (see sim.py's render() default,
+# yaw=270, which was derived the same way). This pose keeps the head above
+# Z=0.6 and needs no per-frame neck compensation at all.
+ATTENTIVE_SHOULDER_PITCH = 0.3
+ATTENTIVE_ELBOW_PITCH = -0.6
 
 
 # look_at / point_at pan+tilt (radians) -> joint targets. pan drives the base
 # yaw (left/right), tilt fine-tunes head pitch (up/down) on top of the
-# facing-the-viewer attentive pose above.
+# facing-the-viewer attentive pose above. neck_yaw stays at 0 -- it's not
+# needed for facing, and a nonzero value reads as a sideways head-turn, not
+# attention (see history above).
 def _look_targets(pan: float, tilt: float) -> dict[str, float]:
     return {
         "base_yaw_joint": _clip(pan, -2.45, 2.45),
         "shoulder_pitch_joint": ATTENTIVE_SHOULDER_PITCH,
         "elbow_pitch_joint": ATTENTIVE_ELBOW_PITCH,
-        "neck_yaw_joint": ATTENTIVE_NECK_YAW,
+        "neck_yaw_joint": 0.0,
         "head_pitch_joint": _clip(tilt, -0.8, 0.6),
     }
 
