@@ -22,6 +22,12 @@ from src.protocol.models import Action
 
 MAX_PAN_RAD = 0.7  # radians; matches base_yaw_joint's usable range for a look
 
+WARM_WHITE = [1.0, 0.95, 0.76]
+NOTICE_FLASH_COUNT = 2
+NOTICE_FLASH_INTERVAL_S = 0.12
+IDLE_BRIGHTNESS = 0.2
+ENGAGED_BRIGHTNESS = 1.0
+
 # While nobody's engaged, the lamp wanders on its own every so often --
 # otherwise it just sits frozen, which reads as "off" rather than "alive but
 # not paying attention to anyone right now". The moment someone engages,
@@ -87,23 +93,28 @@ class CharacterOrchestrator:
     def _on_engage(self, face_x_frac: float) -> None:
         pan = -face_x_frac * MAX_PAN_RAD
         self._on_debug(f"  -> look_at pan={pan:.2f} rad")
+        # "Oh, I see you!" -- a quick bright/dim flash right as it notices,
+        # before it even finishes turning, then settle into full brightness
+        # once it's actually looking at and focused on the person.
+        self._set_light(NOTICE_FLASH_COUNT * [ENGAGED_BRIGHTNESS, 0.05], interval=NOTICE_FLASH_INTERVAL_S)
         self.executor.run(Action(kind="look_at", params={"pan": pan, "tilt": -0.1}))
         self.executor.run(Action(kind="nod", params={}))
         self.executor.run(
-            Action(
-                kind="set_light",
-                params={"on": True, "color": [1.0, 0.95, 0.76], "brightness": 0.8},
-            )
+            Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": ENGAGED_BRIGHTNESS})
         )
 
     def _on_disengage(self) -> None:
         self.executor.run(
-            Action(
-                kind="set_light",
-                params={"on": True, "color": [1.0, 0.95, 0.76], "brightness": 0.2},
-            )
+            Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": IDLE_BRIGHTNESS})
         )
         self.executor.run(Action(kind="home", params={}))
         # Give it a moment to settle at home before wandering starts again,
         # rather than immediately drifting off right as it returns.
         self._next_idle_wander_at = self._schedule_next_idle_wander()
+
+    def _set_light(self, brightness_sequence: list[float], interval: float) -> None:
+        for brightness in brightness_sequence:
+            self.executor.run(
+                Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": brightness})
+            )
+            time.sleep(interval)
