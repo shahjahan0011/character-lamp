@@ -1,14 +1,23 @@
 """Live test: opens the lamp in a GUI window, your webcam, and your
 microphone. Sit in frame -> music stops, a chime plays, it turns toward
 you, nods, flashes then brightens, and starts listening. Say something ->
-it transcribes, replies out loud, and speaks through your speaker. Look
-away for ~2 seconds -> it stops listening, dims, returns home, and the
-idle music resumes.
+after it stops hearing you talk, the light turns a cool blue ("thinking")
+while it understands + replies + synthesizes speech in the background --
+this genuinely takes 30-60+ seconds on the free tier, but the character
+stays fully responsive the whole time (you can still disengage, and it
+will wander/react normally) since none of that runs on the main loop.
+Once ready, it reacts (nod/shake_head/excited/curious) and speaks the
+reply. Look away at any point -> it stops listening, dims, returns home,
+and the idle music resumes; a reply that finishes after you've looked
+away is dropped rather than spoken into an empty room.
 
 Requires GEMINI_API_KEY in a local .env (copy .env.example, add your key
 from https://aistudio.google.com/apikey -- no credit card needed) for the
-transcription/reply/speech steps. Engagement, motion, light, and music
-all work without a key.
+understand/reply/speech steps. Engagement, motion, light, and music all
+work without a key. Free tier: gemini-2.5-flash gets a much more generous
+daily quota than the newest gemini-3.8-flash (confirmed live: the latter
+caps out at ~20 requests/day, easy to exhaust just testing) -- see
+gemini_client.py before changing models.
 
 Usage: .venv/bin/python scripts/test_engagement.py
 Ctrl+C to quit. macOS will prompt for camera and microphone permission the

@@ -107,6 +107,11 @@ class ExecutorHooks:
     on_observe: callable = field(default=lambda: None)
     on_music_on: callable = field(default=lambda: None)
     on_music_off: callable = field(default=lambda: None)
+    # Separate from on_speak: for audio that's *already been synthesized* in
+    # a background worker (see character/dialogue_worker.py), so playing a
+    # reply never re-triggers another ~15s TTS network call on the thread
+    # that's supposed to just be playing it back.
+    on_speak_audio: callable = field(default=lambda wav_bytes: None)
 
 
 class ActionExecutor:

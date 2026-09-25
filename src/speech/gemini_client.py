@@ -16,8 +16,19 @@ from google import genai
 
 # Free-tier-eligible Flash models (see .env.example / project README for
 # where to get a key: https://aistudio.google.com/apikey).
-TEXT_MODEL = "gemini-3.8-flash"
-TTS_MODEL = "gemini-3.8-flash-tts"
+#
+# Deliberately NOT the newest "gemini-3.8-flash" -- hit its free-tier
+# quota live (confirmed via a real 429): only ~20 requests/day. gemini-2.5-
+# flash is the previous Flash generation and gets a far more generous
+# free-tier allowance (hundreds to 1500+ requests/day depending on when
+# Google's own docs were last updated) while still supporting the same
+# audio-in/audio-out interactions.create() calls this project relies on.
+# Given development alone burns through single-digit-to-dozens of calls
+# per session, 20/day is not workable; recheck current per-model limits
+# at https://ai.google.dev/gemini-api/docs/rate-limits before changing
+# this again.
+TEXT_MODEL = "gemini-2.5-flash"
+TTS_MODEL = "gemini-2.5-flash-preview-tts"
 
 _client: genai.Client | None = None
 
