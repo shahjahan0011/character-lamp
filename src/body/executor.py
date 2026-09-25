@@ -23,10 +23,17 @@ from .trajectory import DT, TrajectoryPlayer
 # looking at you" no matter which way the base turns -- the head just spins
 # around while still pointing at the ceiling. A real desk lamp leans its arm
 # down toward what it's looking at, so "looking" bends the shoulder/elbow
-# into a leaning-forward pose (matches the pose we validated visually
-# earlier), not just the base and head.
-ATTENTIVE_SHOULDER_PITCH = 0.7
-ATTENTIVE_ELBOW_PITCH = -1.2
+# into a leaning-forward pose.
+#
+# These specific values were not guessed -- an earlier attempt (0.7, -1.2)
+# *looked* like a reasonable lean in a screenshot but, checked with the
+# light on and the shade's actual opening tracked across a full
+# shoulder/elbow sweep, turned out to show the shade in side profile,
+# never facing the camera at all. This pose was picked from that sweep
+# specifically because the lit shade opening faces the camera, verified
+# across a range of pan values too (see git history for the sweep script).
+ATTENTIVE_SHOULDER_PITCH = -0.6
+ATTENTIVE_ELBOW_PITCH = -1.7
 
 
 # look_at / point_at pan+tilt (radians) -> joint targets. pan drives the base

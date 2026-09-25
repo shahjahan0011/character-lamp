@@ -50,16 +50,29 @@ class TrajectoryPlayer:
         """Start a new move for the given joints (others hold their current
         position). speed_scale < 1.0 slows the whole move down (e.g. for a
         deliberate, gentle gesture); it never exceeds 1.0, since that would
-        violate the joint's velocity limit."""
+        violate the joint's velocity limit.
+
+        All joints in this call share one duration -- the slowest joint's own
+        velocity-limited time. Without this, a multi-joint move like "return
+        home" has each joint arrive at a different moment (whichever has the
+        shortest distance-over-velocity finishes first), which reads as
+        uncoordinated/jerky rather than one settling motion. Sharing the
+        duration only ever slows other joints down to match, never speeds
+        any joint past its own limit."""
         speed_scale = min(1.0, max(0.01, speed_scale))
+        pending: dict[str, tuple[float, float, float]] = {}  # name -> (start, target, natural_duration)
         for name, target in targets.items():
             limits = self.sim.limits_for(name)
             clamped_target = max(limits.lower, min(limits.upper, target))
             start = self.sim.get_joint_angle(name)
             distance = abs(clamped_target - start)
             max_velocity = limits.velocity * speed_scale
-            duration = distance / max_velocity if max_velocity > 0 else 0.0
-            self._moves[name] = JointMove(start=start, target=clamped_target, duration=duration)
+            natural_duration = distance / max_velocity if max_velocity > 0 else 0.0
+            pending[name] = (start, clamped_target, natural_duration)
+
+        group_duration = max((d for _, _, d in pending.values()), default=0.0)
+        for name, (start, clamped_target, _) in pending.items():
+            self._moves[name] = JointMove(start=start, target=clamped_target, duration=group_duration)
 
     def is_moving(self) -> bool:
         return any(not m.done() for m in self._moves.values())
