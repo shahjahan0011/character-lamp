@@ -93,21 +93,14 @@ class EngagementWatcher:
     def _run(self) -> None:
         consecutive_face = 0
         consecutive_absent = 0
-        next_detect_at = 0.0
 
         while self._running:
+            loop_start = time.time()
+
             ok, frame = self._capture.read()
             if not ok:
                 time.sleep(0.05)
                 continue
-
-            now = time.time()
-            if now < next_detect_at:
-                # Still capture (so the driver's buffer doesn't back up),
-                # but skip the expensive detection pass and don't spin.
-                time.sleep(0.01)
-                continue
-            next_detect_at = now + self._detect_interval_s
 
             frame_h, frame_w = frame.shape[:2]
             scale = self._detect_width / frame_w
@@ -144,3 +137,6 @@ class EngagementWatcher:
                     face_x_frac=face_x_frac if found else self._state.face_x_frac,
                     changed_at=time.time() if now_engaged != was_engaged else self._state.changed_at,
                 )
+
+            elapsed = time.time() - loop_start
+            time.sleep(max(0.0, self._detect_interval_s - elapsed))

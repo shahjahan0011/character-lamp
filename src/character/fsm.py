@@ -41,9 +41,10 @@ class CharacterOrchestrator:
     def run_forever(self, poll_hz: float = 10.0) -> None:
         period = 1.0 / poll_hz
         try:
-            while True:
+            while self.executor.sim.is_connected():
                 self.tick()
                 time.sleep(period)
+            self._on_debug("Body simulator disconnected (window closed?) -- exiting.")
         except KeyboardInterrupt:
             pass
 
