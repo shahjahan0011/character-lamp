@@ -52,6 +52,8 @@ class CharacterOrchestrator:
         # failure looks identical to "nothing happened". This surfaces it.
         self._on_debug = on_debug or (lambda msg: None)
         self._next_idle_wander_at = self._schedule_next_idle_wander()
+        # Starts disengaged, so the idle music starts playing immediately.
+        self.executor.run(Action(kind="music_on", params={}))
 
     def _schedule_next_idle_wander(self) -> float:
         return time.time() + random.uniform(IDLE_WANDER_MIN_INTERVAL_S, IDLE_WANDER_MAX_INTERVAL_S)
@@ -93,6 +95,11 @@ class CharacterOrchestrator:
     def _on_engage(self, face_x_frac: float) -> None:
         pan = -face_x_frac * MAX_PAN_RAD
         self._on_debug(f"  -> look_at pan={pan:.2f} rad")
+        # The idle music stops and a chime marks the moment of noticing --
+        # music and "I'm listening to you now" shouldn't overlap once
+        # we're actually paying attention to someone.
+        self.executor.run(Action(kind="music_off", params={}))
+        self.executor.run(Action(kind="play_sound", params={"name": "engage_chime.wav"}))
         # "Oh, I see you!" -- a quick bright/dim flash right as it notices,
         # before it even finishes turning, then settle into full brightness
         # once it's actually looking at and focused on the person.
@@ -108,6 +115,7 @@ class CharacterOrchestrator:
             Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": IDLE_BRIGHTNESS})
         )
         self.executor.run(Action(kind="home", params={}))
+        self.executor.run(Action(kind="music_on", params={}))
         # Give it a moment to settle at home before wandering starts again,
         # rather than immediately drifting off right as it returns.
         self._next_idle_wander_at = self._schedule_next_idle_wander()

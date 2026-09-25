@@ -23,6 +23,8 @@ ActionKind = Literal[
     "shake_head",   # params: {} -- short "no" gesture
     "set_light",    # params: on (bool), color ([r,g,b] 0-1), brightness (0-1)
     "play_sound",   # params: name (str) -- file under assets/sfx or assets/music
+    "music_on",     # params: {} -- start the idle background music loop
+    "music_off",    # params: {} -- stop the idle background music loop
     "speak",        # params: text (str) -- synthesized and played through speaker
     "observe",      # params: {} -- character service should capture+analyze a frame
     "idle_sway",    # params: {} -- small idle motion while waiting, signals "alive"
