@@ -38,10 +38,12 @@ NOTICE_FLASH_INTERVAL_S = 0.12
 IDLE_BRIGHTNESS = 0.2
 ENGAGED_BRIGHTNESS = 1.0
 # Free-tier Gemini audio calls are genuinely slow (measured live: 30-60+
-# seconds combined) -- a cool, dim, distinct color while processing so the
-# wait reads as "thinking", not "frozen/broken".
+# seconds combined) -- a cool, dim, distinct color, a repeated gentle
+# "pondering" gesture, and a soft hum right as it starts, so the wait
+# reads as active thinking, not frozen/broken.
 THINKING_COLOR = [0.55, 0.7, 1.0]
 THINKING_BRIGHTNESS = 0.45
+THINK_PULSE_INTERVAL_S = 3.5
 
 # While nobody's engaged, the lamp wanders on its own every so often --
 # otherwise it just sits frozen, which reads as "off" rather than "alive but
@@ -73,6 +75,7 @@ class CharacterOrchestrator:
         )
         self._last_engaged = False
         self._next_idle_wander_at = self._schedule_next_idle_wander()
+        self._next_think_pulse_at = 0.0
         # Starts disengaged, so the idle music starts playing immediately.
         self.executor.run(Action(kind="music_on", params={}))
 
@@ -113,6 +116,7 @@ class CharacterOrchestrator:
         # happening (including a disengage that happened while it was
         # still in flight; see _check_dialogue_reply).
         self._check_dialogue_reply(state.engaged)
+        self._check_thinking_pulse()
         self._report_failures()
 
     def _check_speech(self) -> None:
@@ -128,6 +132,19 @@ class CharacterOrchestrator:
                     params={"on": True, "color": THINKING_COLOR, "brightness": THINKING_BRIGHTNESS},
                 )
             )
+            self.executor.run(Action(kind="play_sound", params={"name": "thinking_hum.wav"}))
+            self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
+
+    def _check_thinking_pulse(self) -> None:
+        """A slow, repeated 'pondering' dip while a reply is in flight --
+        otherwise the lamp just sits motionless for the entire 30-60+
+        second wait, which reads as frozen even with the light/sound cues."""
+        if self.dialogue_worker is None or not self.dialogue_worker.is_busy():
+            return
+        if time.time() < self._next_think_pulse_at:
+            return
+        self.executor.run(Action(kind="think", params={}))
+        self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
 
     def _check_dialogue_reply(self, currently_engaged: bool) -> None:
         if self.dialogue_worker is None:
@@ -141,9 +158,12 @@ class CharacterOrchestrator:
             self._on_debug(f'(reply ready but no longer engaged, dropping: "{reply.reply}")')
             return
         self._restore_engaged_light()
+        # Start the audio playing first (non-blocking -- see on_speak_audio),
+        # *then* run the gesture, so the gesture happens while it's actually
+        # talking instead of before or after.
+        self._speak_synthesized(reply.audio_bytes)
         if reply.gesture != "none":
             self.executor.run(Action(kind=reply.gesture, params={}))
-        self._speak_synthesized(reply.audio_bytes)
 
     def _speak_synthesized(self, audio_bytes: bytes) -> None:
         """Plays audio already synthesized by DialogueWorker -- deliberately

@@ -123,5 +123,9 @@ def make_audio_hooks(music_volume: float = 0.5, speak: bool = True) -> dict:
 
         hooks["on_speak"] = on_speak
 
-    hooks["on_speak_audio"] = play_bytes
+    # Non-blocking: the whole point of on_speak_audio is playing a reply
+    # that's already been synthesized, specifically so CharacterOrchestrator
+    # can start it and then run a gesture Action *while it plays*, rather
+    # than gesture-then-speak happening one after the other.
+    hooks["on_speak_audio"] = lambda wav_bytes: play_bytes(wav_bytes, blocking=False)
     return hooks
