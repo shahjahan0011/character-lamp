@@ -11,7 +11,13 @@ numpy>=1.26
 opencv-python>=4.9,<5
 sounddevice>=0.4.6
 soundfile>=0.12
+# webrtcvad is old and effectively unmaintained -- it imports pkg_resources
+# unconditionally, which setuptools >=81 no longer bundles. Pinning
+# setuptools below that keeps it working; if pkg_resources is ever
+# actually removed upstream (Python packaging has been threatening this
+# for a while), this needs a VAD replacement, not just a version bump.
 webrtcvad>=2.0.10
+setuptools<81
 # One vendor for vision, dialogue/tool-use, "STT" (native audio input), and
 # TTS (native audio output) -- Gemini's free tier (Flash models) needs no
 # credit card and covers all of it, unlike OpenAI (no free tier at all,
