@@ -58,6 +58,7 @@ class LampSimulator:
     def __init__(self, gui: bool = False, urdf_path: str = URDF_PATH):
         self._client = p.connect(p.GUI if gui else p.DIRECT)
         p.setGravity(0, 0, -9.81, physicsClientId=self._client)
+        self._add_floor()
 
         # useFixedBase=True: the lamp is bolted to a desk, not free-floating.
         self.body_id = p.loadURDF(
@@ -81,6 +82,28 @@ class LampSimulator:
 
         for name in CONTROLLED_JOINTS:
             self.set_joint_angle(name, 0.0)
+
+    def _add_floor(self) -> None:
+        """A plain static floor plane purely so the lamp isn't rendered
+        floating in a void -- no collision behavior depends on this, it's
+        cosmetic (the URDF itself has no world/floor joint by design)."""
+        half_extent = 1.5
+        shape = p.createCollisionShape(
+            p.GEOM_BOX, halfExtents=[half_extent, half_extent, 0.01], physicsClientId=self._client
+        )
+        visual = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[half_extent, half_extent, 0.01],
+            rgbaColor=[0.82, 0.82, 0.80, 1.0],
+            physicsClientId=self._client,
+        )
+        p.createMultiBody(
+            baseMass=0,
+            baseCollisionShapeIndex=shape,
+            baseVisualShapeIndex=visual,
+            basePosition=[0, 0, -0.01],
+            physicsClientId=self._client,
+        )
 
     def _discover_joints_and_links(self) -> None:
         n = p.getNumJoints(self.body_id, physicsClientId=self._client)
@@ -180,7 +203,13 @@ class LampSimulator:
         )
         proj = p.computeProjectionMatrixFOV(fov=45, aspect=width / height, nearVal=0.05, farVal=3.0)
         _, _, rgba, _, _ = p.getCameraImage(
-            width, height, viewMatrix=view, projectionMatrix=proj, physicsClientId=self._client
+            width,
+            height,
+            viewMatrix=view,
+            projectionMatrix=proj,
+            shadow=1,
+            lightDirection=[0.6, -0.4, 1.0],
+            physicsClientId=self._client,
         )
         import numpy as np
 
