@@ -45,6 +45,7 @@ from src.body.executor import ActionExecutor, ExecutorHooks
 from src.body.sim import LampSimulator
 from src.character.fsm import CharacterOrchestrator
 from src.character.memory import SceneMemory
+from src.character.metrics import MetricsLog
 from src.perception.engagement import EngagementState, EngagementWatcher
 from src.protocol.observation import DetectedObject, Observation
 from src.speech.audio_mixer import AudioMixer
@@ -170,10 +171,11 @@ def run_offline_demo(headless: bool, data_dir: Path) -> None:
             return fake_frame
 
     memory = SceneMemory(persist_path=data_dir / "scene_memory.json", on_debug=log.debug)
+    metrics = MetricsLog(path=data_dir / "metrics.jsonl", on_debug=log.debug)
 
     with patch("src.speech.vision.describe_scene", side_effect=fake_describe_scene):
         orchestrator = CharacterOrchestrator(
-            executor, _FakeWatcher(), audio_mixer=mixer, memory=memory, on_debug=log.info
+            executor, _FakeWatcher(), audio_mixer=mixer, memory=memory, metrics=metrics, on_debug=log.info
         )
         orchestrator.tick()  # ENGAGE -- also fires an ambient "scene" observation
         log.info("[1/8] engagement transition -> ENGAGE")
@@ -253,9 +255,11 @@ def run_offline_demo(headless: bool, data_dir: Path) -> None:
         log.info(f"    FAILURE case (invalid ordering): rejected as expected -- {rejected['error']}")
 
     orchestrator.observer.stop()
+    metrics.close()
     mixer.close()
     sim.close()
     log.info("Offline demo complete -- all 8 steps passed using the real goal/memory/tool workflow.")
+    log.info(f"Metrics written to {data_dir / 'metrics.jsonl'} -- see scripts/summarize_metrics.py")
 
 
 def run_live(args: argparse.Namespace) -> None:
@@ -305,9 +309,10 @@ def run_live(args: argparse.Namespace) -> None:
     log.info("While engaged, speak -- it only listens while it's paying attention to you.")
 
     memory = SceneMemory(persist_path=data_dir / "scene_memory.json", on_debug=log.debug)
+    metrics = MetricsLog(path=data_dir / "metrics.jsonl", on_debug=log.debug)
     orchestrator = CharacterOrchestrator(
         executor, watcher, live_client=live_client, audio_mixer=mixer, memory=memory,
-        error_speech=error_speech, on_debug=log.debug,
+        error_speech=error_speech, metrics=metrics, on_debug=log.debug,
     )
     try:
         orchestrator.run_forever(poll_hz=10.0)
@@ -319,6 +324,7 @@ def run_live(args: argparse.Namespace) -> None:
             mic_streamer.stop()
         if live_client is not None:
             live_client.close()
+        metrics.close()
         mixer.close()
         sim.close()
 

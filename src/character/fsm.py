@@ -44,6 +44,7 @@ from src.character.character_state import (
 )
 from src.character.goal_coordinator import GoalCoordinator
 from src.character.memory import SceneMemory
+from src.character.metrics import MetricsLog
 from src.character.observation_registry import ObservationRegistry
 from src.character.scene_observer import SceneObserver
 from src.character.tool_gateway import ToolGateway
@@ -121,6 +122,11 @@ REOBSERVE_BACKOFF_S = 300.0
 IDLE_WANDER_MIN_INTERVAL_S = 4.0
 IDLE_WANDER_MAX_INTERVAL_S = 9.0
 
+# How often to sample this process's own CPU%/RSS into the metrics log --
+# frequent enough to characterize steady-state load, not so frequent that
+# the sampling itself (a psutil syscall) is a meaningful part of that load.
+RESOURCE_SAMPLE_INTERVAL_S = 5.0
+
 
 class CharacterOrchestrator:
     def __init__(
@@ -135,6 +141,7 @@ class CharacterOrchestrator:
         goals: GoalCoordinator | None = None,
         gateway: ToolGateway | None = None,
         error_speech: ErrorSpeech | None = None,
+        metrics: MetricsLog | None = None,
         on_debug: Callable[[str], None] | None = None,
     ):
         self.executor = executor
@@ -148,6 +155,9 @@ class CharacterOrchestrator:
         # bad action shouldn't kill the demo), which otherwise means a
         # failure looks identical to "nothing happened". This surfaces it.
         self._on_debug = on_debug or (lambda msg: None)
+        self.metrics = metrics if metrics is not None else MetricsLog(path=None, on_debug=self._on_debug)
+        self._last_resource_sample_at = 0.0
+        self._turn_started_monotonic = 0.0
         # NOT `memory or SceneMemory()` -- SceneMemory defines __len__, so an
         # empty-but-real instance passed in (the normal case: nothing's been
         # observed yet) is falsy and `or` would silently swap in a different
@@ -211,9 +221,11 @@ class CharacterOrchestrator:
         state = self.watcher.get_state()
         if state.engaged and not self._last_engaged:
             self._on_debug(f"ENGAGE face_x_frac={state.face_x_frac:.2f}")
+            self.metrics.event("engaged", face_x_frac=state.face_x_frac)
             self._on_engage(state.face_x_frac)
         elif not state.engaged and self._last_engaged:
             self._on_debug("DISENGAGE")
+            self.metrics.event("disengaged")
             self._on_disengage()
         elif not state.engaged and time.monotonic() >= self._next_idle_wander_at:
             self._on_debug("idle wander")
@@ -232,6 +244,14 @@ class CharacterOrchestrator:
         self._check_reobserve(state.engaged)
         self._check_new_observation()
         self._report_failures()
+        self._sample_resources_if_due()
+
+    def _sample_resources_if_due(self) -> None:
+        now = time.monotonic()
+        if now - self._last_resource_sample_at < RESOURCE_SAMPLE_INTERVAL_S:
+            return
+        self._last_resource_sample_at = now
+        self.metrics.sample_resources()
 
     # -- Gemini Live event handling -------------------------------------------
 
@@ -270,7 +290,8 @@ class CharacterOrchestrator:
         """Local silence detection just committed the user's utterance
         (see live_capture.py) -- Gemini is now formulating a reply."""
         self._turn_in_flight = True
-        self._turn_deadline = time.monotonic() + TURN_TIMEOUT_S
+        self._turn_started_monotonic = time.monotonic()
+        self._turn_deadline = self._turn_started_monotonic + TURN_TIMEOUT_S
         self._awaiting_first_audio = True
         self._try_transition(CharacterState.THINKING)
         self.executor.run(
@@ -294,6 +315,9 @@ class CharacterOrchestrator:
         if not currently_engaged:
             return
         if self._awaiting_first_audio:
+            latency_s = time.monotonic() - self._turn_started_monotonic
+            self.metrics.event("first_audio", latency_s=latency_s)
+            self._on_debug(f"live: first audio in {latency_s:.2f}s")
             self._awaiting_first_audio = False
             self._turn_deadline = time.monotonic() + TURN_TIMEOUT_S  # still speaking; extend the watchdog
             self._try_transition(CharacterState.SPEAKING)
