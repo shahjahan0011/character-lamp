@@ -128,7 +128,7 @@ class EngagementWatcher:
             faces = self._cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(40, 40))
             if len(faces) > 0:
                 # Largest face = closest/most prominent person in frame.
-                x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                x, _y, w, _h = max(faces, key=lambda f: f[2] * f[3])
                 center_x = x + w / 2
                 face_x_frac = (center_x / small.shape[1]) * 2 - 1  # -1 .. +1
                 found = True

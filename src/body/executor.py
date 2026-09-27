@@ -68,6 +68,40 @@ def _clip(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
 
 
+# Normalized image point (0.0-1.0, origin top-left) -> pan/tilt (rad),
+# for the look_at_image_point Live tool (demo moment 5). Deliberately
+# reuses this project's existing engagement-tracking convention rather
+# than inventing a new one: fsm.py's _on_engage already computes
+# `pan = -face_x_frac * MAX_PAN_RAD` from a horizontal face position in
+# -1..+1 (frame-left..frame-right); `(0.5 - x) * 2` maps a normalized
+# 0..1 image_x onto that same -1..+1 range with the same sign (x=0/left
+# -> +1 -> pan turns left, matching "pan is +left" -- see _look_targets).
+# vertical_gain follows the same idea for tilt, whose existing clip range
+# (-0.8..0.6, see _look_targets) is asymmetric toward "down" since a desk
+# lamp mostly looks down at its desk -- image_y=1 (bottom of frame) maps
+# to a negative (down) tilt to match.
+#
+# This is approximate 2-D image-space pointing, not 3-D localization --
+# there is no depth estimate, so a real gain that "feels right" can only
+# be confirmed by watching the lamp point at a real object through a
+# real camera, which needs live hardware access this environment doesn't
+# have. Keep both gains configurable rather than hardcoded so they can be
+# tuned during that live check without touching the mapping logic itself.
+IMAGE_POINT_HORIZONTAL_GAIN = 0.7  # matches fsm.py's MAX_PAN_RAD for face-tracking
+IMAGE_POINT_VERTICAL_GAIN = 0.5
+
+
+def image_point_to_pan_tilt(
+    x: float,
+    y: float,
+    horizontal_gain: float = IMAGE_POINT_HORIZONTAL_GAIN,
+    vertical_gain: float = IMAGE_POINT_VERTICAL_GAIN,
+) -> tuple[float, float]:
+    pan = horizontal_gain * (0.5 - x) * 2
+    tilt = vertical_gain * (0.5 - y) * 2
+    return pan, tilt
+
+
 HOME_POSE = {
     "base_yaw_joint": 0.0,
     "shoulder_pitch_joint": 0.0,
@@ -137,9 +171,7 @@ class ActionExecutor:
 
     def _dispatch(self, action: Action, speed_scale: float) -> None:
         p = action.params
-        if action.kind == "look_at":
-            self._move_and_settle(_look_targets(p.get("pan", 0.0), p.get("tilt", 0.0)), speed_scale)
-        elif action.kind == "point_at":
+        if action.kind == "look_at" or action.kind == "point_at":
             self._move_and_settle(_look_targets(p.get("pan", 0.0), p.get("tilt", 0.0)), speed_scale)
         elif action.kind == "nod":
             current = self.sim.get_all_joint_angles()

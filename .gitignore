@@ -7,10 +7,17 @@ __pycache__/
 logs/
 *.egg-info/
 .pytest_cache/
+.ruff_cache/
 scratch_renders/
+
+# Generated runtime data (persisted scene memory, metrics, corrupt-file
+# backups) -- observable/inspectable during a real run, not submission
+# content. See SceneMemory's persist_path / --data-dir.
+/var/
 
 # Reference/demo images - never push these
 *.png
 *.jpg
 *.jpeg
 !robot/assets/**
+!robot/dummy-lamp.png

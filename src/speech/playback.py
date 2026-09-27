@@ -124,7 +124,9 @@ def make_audio_hooks(music_volume: float = 0.5, speak: bool = True) -> dict:
     }
 
     if speak:
-        from . import tts  # deferred: only needed (and only requires a key) if speak=True
+        from . import (
+            tts,  # deferred: only needed (and only requires a key) if speak=True
+        )
 
         def on_speak(text: str) -> None:
             play_bytes(tts.synthesize(text))

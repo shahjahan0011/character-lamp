@@ -12,9 +12,12 @@ types work whether the transport underneath is an in-process asyncio.Queue
 from __future__ import annotations
 
 import time
-from typing import Literal, Optional
+from typing import Literal
 
 from pydantic import BaseModel, Field
+
+GestureName = Literal["nod", "shake_head", "excited", "curious", "think"]
+GESTURE_NAMES = frozenset({"nod", "shake_head", "excited", "curious", "think"})
 
 ActionKind = Literal[
     "look_at",      # params: pan (rad, +left), tilt (rad, +up)
@@ -45,7 +48,7 @@ class ActionBatch(BaseModel):
     executed -- kept only for logging/explainability in the demo and note."""
 
     actions: list[Action]
-    reason: Optional[str] = None
+    reason: str | None = None
 
 
 TelemetryKind = Literal[

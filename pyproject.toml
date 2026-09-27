@@ -1,0 +1,74 @@
+[project]
+name = "character-lamp"
+version = "0.1.0"
+description = "A live, expressive Pixar-Luxo-Jr-style desk lamp character: PyBullet body, persistent Gemini Live conversation, structured scene memory, and goal-directed vision-grounded action."
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+# Python 3.11, not 3.12/3.13: pybullet ships prebuilt manylinux wheels for
+# cp310/cp311 but not cp312+ at the time this was written, and Ubuntu
+# 24.04 LTS's default python3 is 3.12 -- see README.md's Ubuntu setup
+# section for the exact `deadsnakes` PPA steps to get 3.11 there. macOS
+# has no prebuilt pybullet wheel at any version (see
+# scripts/install_pybullet_macos.sh's build-from-source workaround).
+dependencies = [
+    "pybullet>=3.2.6,<4",
+    "pydantic>=2.6,<3",
+    "numpy>=1.26,<3",
+    # Pinned below 5.0: opencv-python 5.x removed CascadeClassifier entirely
+    # (replaced by the DNN-based FaceDetectorYN), breaking the Haar-cascade
+    # approach this project uses for engagement detection.
+    "opencv-python>=4.9,<5",
+    "sounddevice>=0.4.6,<1",
+    "soundfile>=0.12,<1",
+    # One vendor for vision, tool-use/goal reasoning, native audio
+    # conversation (Live), and TTS -- Gemini's free tier (Flash models)
+    # needs no credit card and covers all of it. Upper-bounded: this
+    # project relies on interactions.create()'s response_format JSON-
+    # schema constraint, client.aio.live.connect(), and function-
+    # declaration `behavior: BLOCKING`, all confirmed against 2.25.0 --
+    # an unannounced breaking change in a major version bump is a real
+    # risk worth guarding against explicitly.
+    "google-genai>=2.20,<3",
+    "python-dotenv>=1.0,<2",
+    "psutil>=5.9,<8",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8,<10",
+    "pytest-mock>=3.14,<4",
+    "ruff>=0.9,<1",
+]
+
+# No [project.scripts] console-script entry point. `pip install -e .`
+# does succeed (verified) and installs the declared dependencies, but it
+# does NOT make `src.*` importable from outside the repository root --
+# tested live: `import src.body.executor` fails from another directory
+# even after an editable install, since the project has no single
+# top-level package name (src/body, src/character, etc. are separate
+# subpackages under src/, matching this project's existing convention of
+# `sys.path.insert`-ing the repo root in each script rather than being
+# pip-installed as a relocatable package). Use this file for dependency
+# version bounds and dev tooling (`pip install -e ".[dev]"` for
+# pytest/ruff); run the project itself via
+# `python scripts/run_character.py` from the repository root -- see
+# README.md.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+target-version = "py311"
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "BLE", "C4", "SIM", "RUF"]
+ignore = ["E501"]  # long descriptive comments/docstrings are this project's own style
+
+[tool.ruff.lint.per-file-ignores]
+# Destructuring a test helper's full return tuple and only using part of
+# it (e.g. `orch, executor, watcher, live_client, mixer, memory = ...`)
+# reads far more clearly across many tests than a differently-shaped
+# helper per test -- not worth chasing with underscore-prefixes everywhere.
+"tests/*" = ["RUF059"]

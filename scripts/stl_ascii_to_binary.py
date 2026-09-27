@@ -40,14 +40,13 @@ def write_binary_stl(path: str, facets) -> None:
         f.write(struct.pack("<I", len(facets)))
         for normal, verts in facets:
             f.write(struct.pack("<3f", *normal))
-            for v in verts:
-                f.write(struct.pack("<3f", *v))
+            f.writelines(struct.pack("<3f", *v) for v in verts)
             f.write(struct.pack("<H", 0))
 
 
 def main() -> None:
     path = sys.argv[1]
-    with open(path, "r") as f:
+    with open(path) as f:
         text = f.read()
     facets = parse_ascii_stl(text)
     if not facets:

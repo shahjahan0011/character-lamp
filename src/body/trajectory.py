@@ -16,6 +16,15 @@ from .sim import CONTROLLED_JOINTS, LampSimulator
 CONTROL_HZ = 50.0
 DT = 1.0 / CONTROL_HZ
 
+# The smoothstep curve used in JointMove.angle_at (3t^2 - 2t^3) has
+# derivative 6t(1-t), which peaks at t=0.5 with value 1.5 -- 1.5x the
+# *average* velocity implied by distance/duration. A duration computed as
+# plain distance/max_velocity therefore lets the joint's peak instantaneous
+# velocity exceed max_velocity by 50%, silently violating the URDF's own
+# velocity limit. Scaling the duration by this factor keeps the smoothstep
+# peak, not just the average, within the limit.
+SMOOTHSTEP_PEAK_FACTOR = 1.5
+
 
 @dataclass
 class JointMove:
@@ -67,7 +76,9 @@ class TrajectoryPlayer:
             start = self.sim.get_joint_angle(name)
             distance = abs(clamped_target - start)
             max_velocity = limits.velocity * speed_scale
-            natural_duration = distance / max_velocity if max_velocity > 0 else 0.0
+            natural_duration = (
+                SMOOTHSTEP_PEAK_FACTOR * distance / max_velocity if max_velocity > 0 else 0.0
+            )
             pending[name] = (start, clamped_target, natural_duration)
 
         group_duration = max((d for _, _, d in pending.values()), default=0.0)
@@ -85,4 +96,4 @@ class TrajectoryPlayer:
             self.sim.set_joint_angle(name, move.angle_at(move.elapsed))
 
     def home(self) -> None:
-        self.move_to({name: 0.0 for name in CONTROLLED_JOINTS})
+        self.move_to(dict.fromkeys(CONTROLLED_JOINTS, 0.0))

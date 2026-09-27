@@ -18,7 +18,7 @@ the reference implementation this pipeline is adapted from.
 
 from __future__ import annotations
 
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -36,7 +36,7 @@ class LiveMicStreamer:
     def __init__(
         self,
         live_client: GeminiLiveClient,
-        on_debug: Optional[Callable[[str], None]] = None,
+        on_debug: Callable[[str], None] | None = None,
     ):
         self._live = live_client
         self._on_debug = on_debug or (lambda msg: None)

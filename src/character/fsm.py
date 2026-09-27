@@ -34,16 +34,24 @@ from __future__ import annotations
 
 import random
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 from src.body.executor import ActionExecutor
+from src.character.character_state import (
+    CharacterState,
+    CharacterStateMachine,
+    InvalidTransitionError,
+)
+from src.character.goal_coordinator import GoalCoordinator
 from src.character.memory import SceneMemory
+from src.character.observation_registry import ObservationRegistry
 from src.character.scene_observer import SceneObserver
+from src.character.tool_gateway import ToolGateway
 from src.perception.engagement import EngagementWatcher
 from src.protocol.models import Action
 from src.speech.audio_mixer import AudioMixer
 from src.speech.error_speech import ErrorSpeech
-from src.speech.live_client import GESTURE_NAMES, GeminiLiveClient, LiveEvent
+from src.speech.live_client import GeminiLiveClient, LiveEvent
 
 # Don't re-announce a connection problem on every retry within a fast
 # reconnect loop (0.5s/1s/2s/4s backoff, see live_client.py) -- one
@@ -119,12 +127,15 @@ class CharacterOrchestrator:
         self,
         executor: ActionExecutor,
         watcher: EngagementWatcher,
-        live_client: Optional[GeminiLiveClient] = None,
-        audio_mixer: Optional[AudioMixer] = None,
-        observer: Optional[SceneObserver] = None,
-        memory: Optional[SceneMemory] = None,
-        error_speech: Optional[ErrorSpeech] = None,
-        on_debug: Optional[Callable[[str], None]] = None,
+        live_client: GeminiLiveClient | None = None,
+        audio_mixer: AudioMixer | None = None,
+        observer: SceneObserver | None = None,
+        memory: SceneMemory | None = None,
+        registry: ObservationRegistry | None = None,
+        goals: GoalCoordinator | None = None,
+        gateway: ToolGateway | None = None,
+        error_speech: ErrorSpeech | None = None,
+        on_debug: Callable[[str], None] | None = None,
     ):
         self.executor = executor
         self.watcher = watcher
@@ -142,9 +153,21 @@ class CharacterOrchestrator:
         # observed yet) is falsy and `or` would silently swap in a different
         # object than the caller shared with us.
         self.memory = memory if memory is not None else SceneMemory()
+        self.registry = registry if registry is not None else ObservationRegistry()
+        self.goals = goals if goals is not None else GoalCoordinator(self.registry)
         self.observer = observer if observer is not None else SceneObserver(
-            memory=self.memory, on_debug=self._on_debug
+            memory=self.memory, registry=self.registry, on_debug=self._on_debug
         )
+        self.gateway = gateway if gateway is not None else ToolGateway(
+            executor=self.executor,
+            observer=self.observer,
+            registry=self.registry,
+            memory=self.memory,
+            goals=self.goals,
+            get_latest_frame=self.watcher.get_latest_frame,
+            on_debug=self._on_debug,
+        )
+        self.state_machine = CharacterStateMachine(on_debug=self._on_debug)
         self._last_engaged = False
         self._next_idle_wander_at = self._schedule_next_idle_wander()
         self._next_think_pulse_at = 0.0
@@ -153,12 +176,22 @@ class CharacterOrchestrator:
         self._awaiting_first_audio = False
         self._next_reobserve_at = 0.0
         self._nudged_this_engagement = False
-        self._output_drained_at: Optional[float] = None
+        self._output_drained_at: float | None = None
         # Starts disengaged, so the idle music starts playing immediately.
         self.executor.run(Action(kind="music_on", params={}))
 
+    def _try_transition(self, target: CharacterState) -> None:
+        """The state machine formalizes/observes the same decisions the
+        existing flags below already make -- it doesn't yet replace them
+        as the sole source of truth (see module docstring), so an
+        unexpected edge here is logged, not fatal to the demo."""
+        try:
+            self.state_machine.transition(target)
+        except InvalidTransitionError as exc:
+            self._on_debug(f"state machine: {exc}")
+
     def _schedule_next_idle_wander(self) -> float:
-        return time.time() + random.uniform(IDLE_WANDER_MIN_INTERVAL_S, IDLE_WANDER_MAX_INTERVAL_S)
+        return time.monotonic() + random.uniform(IDLE_WANDER_MIN_INTERVAL_S, IDLE_WANDER_MAX_INTERVAL_S)
 
     def run_forever(self, poll_hz: float = 10.0) -> None:
         period = 1.0 / poll_hz
@@ -182,7 +215,7 @@ class CharacterOrchestrator:
         elif not state.engaged and self._last_engaged:
             self._on_debug("DISENGAGE")
             self._on_disengage()
-        elif not state.engaged and time.time() >= self._next_idle_wander_at:
+        elif not state.engaged and time.monotonic() >= self._next_idle_wander_at:
             self._on_debug("idle wander")
             self.executor.run(Action(kind="idle_sway", params={}))
             self._next_idle_wander_at = self._schedule_next_idle_wander()
@@ -228,7 +261,7 @@ class CharacterOrchestrator:
             elif event.kind == "error":
                 self._on_debug(f"live: error: {event.message}")
                 if currently_engaged and self.error_speech is not None:
-                    now = time.time()
+                    now = time.monotonic()
                     if now - self._last_connection_error_announced_at >= CONNECTION_ERROR_ANNOUNCE_COOLDOWN_S:
                         self._last_connection_error_announced_at = now
                         self.error_speech.say("connection")
@@ -237,8 +270,9 @@ class CharacterOrchestrator:
         """Local silence detection just committed the user's utterance
         (see live_capture.py) -- Gemini is now formulating a reply."""
         self._turn_in_flight = True
-        self._turn_deadline = time.time() + TURN_TIMEOUT_S
+        self._turn_deadline = time.monotonic() + TURN_TIMEOUT_S
         self._awaiting_first_audio = True
+        self._try_transition(CharacterState.THINKING)
         self.executor.run(
             Action(
                 kind="set_light",
@@ -246,7 +280,7 @@ class CharacterOrchestrator:
             )
         )
         self.executor.run(Action(kind="play_sound", params={"name": "thinking_hum.wav"}))
-        self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
+        self._next_think_pulse_at = time.monotonic() + THINK_PULSE_INTERVAL_S
 
     def _on_audio_chunk(self, currently_engaged: bool) -> None:
         """The actual audio bytes are fed to the mixer directly from
@@ -261,40 +295,47 @@ class CharacterOrchestrator:
             return
         if self._awaiting_first_audio:
             self._awaiting_first_audio = False
-            self._turn_deadline = time.time() + TURN_TIMEOUT_S  # still speaking; extend the watchdog
+            self._turn_deadline = time.monotonic() + TURN_TIMEOUT_S  # still speaking; extend the watchdog
+            self._try_transition(CharacterState.SPEAKING)
             self._restore_engaged_light()
 
     def _on_tool_call(self, event: LiveEvent) -> None:
-        name = (event.tool_args or {}).get("name")
-        valid = name in GESTURE_NAMES
-        if valid:
-            self.executor.run(Action(kind=name, params={}))
-        else:
-            self._on_debug(f"live: rejected invalid gesture tool call: {event.tool_args!r}")
-        # Gemini's turn stays open waiting for this -- an unknown/invalid
-        # name still gets an explicit response so the turn isn't left
-        # hanging, it just reports ok=False rather than performing anything.
-        self.live_client.submit_tool_result(
-            event.tool_call_id or "", event.tool_name or "perform_gesture", {"ok": valid}
-        )
+        """Every tool call goes through ToolGateway's strict validation
+        and local invariant enforcement (goal ordering, observation
+        freshness) -- this method only handles the Live-session plumbing
+        around that: submitting a result immediately for a synchronous
+        tool, or leaving it pending for request_observation (None means
+        "queued on SceneObserver's background thread"; see
+        _check_new_observation, which completes it once that finishes)."""
+        name = event.tool_name or ""
+        args = event.tool_args or {}
+        call_id = event.tool_call_id or ""
+        if name in ("look_at_image_point", "set_light", "perform_gesture"):
+            self._try_transition(CharacterState.ACTING)
+        result = self.gateway.execute(name, args, call_id)
+        if result is not None:
+            self.live_client.submit_tool_result(call_id, name, result)
 
     def _on_turn_complete(self, currently_engaged: bool) -> None:
         self._turn_in_flight = False
         self._awaiting_first_audio = False
         if currently_engaged:
+            self._try_transition(CharacterState.ENGAGED)
             self._restore_engaged_light()
         # else: nothing to do -- _on_disengage() already set the idle
         # light, and _on_audio_chunk() already suppressed any audio.
 
     def _check_turn_timeout(self, currently_engaged: bool) -> None:
-        if not self._turn_in_flight or time.time() < self._turn_deadline:
+        if not self._turn_in_flight or time.monotonic() < self._turn_deadline:
             return
         self._on_debug("live: turn timed out (no audio/turn_complete) -- releasing mic gate")
         self._turn_in_flight = False
         self._awaiting_first_audio = False
         if currently_engaged:
+            self._try_transition(CharacterState.ERROR)
             self.executor.run(Action(kind="shake_head", params={}))
             self._restore_engaged_light()
+            self._try_transition(CharacterState.ENGAGED)
             if self.error_speech is not None:
                 self.error_speech.say("timeout")
 
@@ -304,10 +345,10 @@ class CharacterOrchestrator:
         during the (now much shorter, but nonzero) wait for first audio."""
         if not self._turn_in_flight or not self._awaiting_first_audio:
             return
-        if time.time() < self._next_think_pulse_at:
+        if time.monotonic() < self._next_think_pulse_at:
             return
         self.executor.run(Action(kind="think", params={}))
-        self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
+        self._next_think_pulse_at = time.monotonic() + THINK_PULSE_INTERVAL_S
 
     def _update_mic_gate(self, currently_engaged: bool) -> None:
         """Recomputed every tick from live state rather than a guessed mute
@@ -323,15 +364,15 @@ class CharacterOrchestrator:
         if output_pending:
             self._output_drained_at = None
         elif self._output_drained_at is None:
-            self._output_drained_at = time.time()
+            self._output_drained_at = time.monotonic()
         drained_long_enough = (
             self._output_drained_at is not None
-            and time.time() - self._output_drained_at >= MIC_REOPEN_GRACE_S
+            and time.monotonic() - self._output_drained_at >= MIC_REOPEN_GRACE_S
         )
         should_be_open = currently_engaged and not self._turn_in_flight and drained_long_enough
         self.live_client.set_mic_gate(should_be_open)
 
-    # -- scene memory ----------------------------------------------------------
+    # -- scene memory + goal observations ---------------------------------------
 
     def _check_reobserve(self, currently_engaged: bool) -> None:
         """Re-scans the surroundings periodically while engaged, not just
@@ -340,28 +381,64 @@ class CharacterOrchestrator:
         instant someone first looked at it."""
         if not currently_engaged:
             return
-        if time.time() < self._next_reobserve_at:
+        if time.monotonic() < self._next_reobserve_at:
             return
         self._observe_scene()
-        self._next_reobserve_at = time.time() + REOBSERVE_INTERVAL_S
+        self._next_reobserve_at = time.monotonic() + REOBSERVE_INTERVAL_S
 
     def _check_new_observation(self) -> None:
         if self.observer.pop_failure():
-            # Silent by design: nobody's watching a "vision call failed"
-            # cue specifically, and the person can just ask again later --
-            # unlike a failed spoken turn, there's no waiting conversational
-            # turn to visibly resolve.
+            # Silent by design for the *ambient* case: nobody's watching a
+            # "vision call failed" cue specifically, and the person can
+            # just ask again later. A tool-driven request_observation is
+            # different -- Gemini is actually BLOCKING on it, so that one
+            # gets a real structured tool error below instead of being
+            # left hanging.
             self._on_debug("scene observer: last observation failed")
             if self.observer.pop_rate_limited():
-                self._next_reobserve_at = time.time() + REOBSERVE_BACKOFF_S
+                self._next_reobserve_at = time.monotonic() + REOBSERVE_BACKOFF_S
                 self._on_debug(
                     f"scene observer: rate-limited, backing off {REOBSERVE_BACKOFF_S:.0f}s"
                 )
+            failed_call = self.observer.pop_failed_tool_call()
+            if failed_call is not None and self.live_client is not None:
+                call_id, tool_name, message = failed_call
+                self.live_client.submit_tool_result(call_id, tool_name, {"ok": False, "error": message})
+
         result = self.observer.pop_new_observation()
         if result is None:
             return
-        objects, changed = result
-        # Confirmed live: injecting scene-memory text mid-conversation via
+
+        if result.tool_call_id is not None:
+            # A tool-driven observation (object_memory/goal_planning/
+            # goal_verification) -- advance the goal workflow if this was
+            # for the active goal, then complete the BLOCKING tool call
+            # with the real, structured result (never invented).
+            self.gateway.complete_observation_for_goal(result.observation.observation_id, result.observation.purpose)
+            if result.observation.purpose == "goal_verification":
+                self._try_transition(CharacterState.VERIFYING)
+            if self.live_client is not None:
+                payload = {
+                    "ok": True,
+                    "observation_id": result.observation.observation_id,
+                    "goal_id": self.gateway._current_goal_id,
+                    "objects": [
+                        {
+                            "label": o.label,
+                            "color": o.color,
+                            "attributes": o.attributes,
+                            "image_x": o.image_x,
+                            "image_y": o.image_y,
+                            "confidence": o.confidence,
+                        }
+                        for o in result.observation.objects
+                    ],
+                }
+                self.live_client.submit_tool_result(result.tool_call_id, result.tool_name or "request_observation", payload)
+            return
+
+        # Ambient "scene" observation (demo moment 4). Confirmed live:
+        # injecting scene-memory text mid-conversation via
         # send_realtime_input(text=...) makes Gemini speak in response
         # EVERY time, even with an explicit "don't say anything, this is
         # silent" instruction in the text itself -- that's what "randomly
@@ -372,9 +449,10 @@ class CharacterOrchestrator:
         # depends on. Given that, only relay a nudge once per engagement
         # (right after the first observation completes) rather than on
         # every periodic re-observation -- local memory still updates
-        # continuously either way (see _check_reobserve), so a later
-        # question is answered from whatever's freshest in self.memory;
-        # it just isn't volunteered mid-conversation on its own.
+        # continuously either way (see _check_reobserve), and can also be
+        # recalled on demand via the recall_memory Live tool, so a later
+        # question is answered from whatever's freshest either way; it
+        # just isn't volunteered mid-conversation on its own.
         if self._nudged_this_engagement:
             return
         self._nudged_this_engagement = True
@@ -382,16 +460,20 @@ class CharacterOrchestrator:
             self.live_client.send_text_nudge(self.memory.as_context_text())
 
     def _observe_scene(self) -> None:
-        """Kicks off one scene-description call (demo moment 4) -- grabs
-        whatever frame EngagementWatcher's camera thread most recently
-        captured rather than opening a second camera handle (most webcams
-        only allow one consumer). Fire-and-forget: the result lands in
-        self.memory whenever SceneObserver gets to it, and is relayed into
-        the live conversation via _check_new_observation() above."""
+        """Kicks off one ambient scene-description call (demo moment 4) --
+        grabs whatever frame EngagementWatcher's camera thread most
+        recently captured rather than opening a second camera handle
+        (most webcams only allow one consumer). Fire-and-forget: the
+        result lands in self.memory whenever SceneObserver gets to it,
+        and is relayed into the live conversation via
+        _check_new_observation() above. Tool-driven request_observation
+        calls (object_memory/goal_planning/goal_verification) go through
+        ToolGateway instead, which submits directly to the same
+        SceneObserver with a tool_call_id attached."""
         frame = self.watcher.get_latest_frame()
         if frame is None:
             return
-        self.observer.submit_observation(frame)
+        self.observer.submit_observation(frame, purpose="scene")
 
     def _restore_engaged_light(self) -> None:
         self.executor.run(
@@ -427,6 +509,7 @@ class CharacterOrchestrator:
                     )
 
     def _on_engage(self, face_x_frac: float) -> None:
+        self._try_transition(CharacterState.NOTICING)
         pan = -face_x_frac * MAX_PAN_RAD
         self._on_debug(f"  -> look_at pan={pan:.2f} rad")
         # The idle music stops and a chime marks the moment of noticing --
@@ -445,11 +528,23 @@ class CharacterOrchestrator:
         )
         # Mic gate opens on the next tick via _update_mic_gate (engaged,
         # no turn in flight, nothing playing) -- no separate call needed.
+        self._try_transition(CharacterState.ENGAGED)
         self._nudged_this_engagement = False
         self._observe_scene()
-        self._next_reobserve_at = time.time() + REOBSERVE_INTERVAL_S
+        self._next_reobserve_at = time.monotonic() + REOBSERVE_INTERVAL_S
 
     def _on_disengage(self) -> None:
+        self._try_transition(CharacterState.DISENGAGING)
+        if self.live_client is not None:
+            # Clear engaged/audio-output permission FIRST, before the
+            # blocking home motion below -- otherwise late-arriving audio
+            # from a reply still in flight could keep playing for the
+            # whole (blocking, potentially ~1s+) duration of the home
+            # gesture, since GeminiLiveClient's own audio-feed gating
+            # (see live_client.py's set_engaged) wouldn't be updated until
+            # after this method returns.
+            self.live_client.set_engaged(False)
+            self.live_client.set_mic_gate(False)
         self.executor.run(
             Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": IDLE_BRIGHTNESS})
         )
@@ -458,6 +553,7 @@ class CharacterOrchestrator:
         # Give it a moment to settle at home before wandering starts again,
         # rather than immediately drifting off right as it returns.
         self._next_idle_wander_at = self._schedule_next_idle_wander()
+        self._try_transition(CharacterState.DORMANT)
 
     def _set_light(self, brightness_sequence: list[float], interval: float) -> None:
         for brightness in brightness_sequence:

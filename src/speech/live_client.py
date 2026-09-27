@@ -29,28 +29,35 @@ CharacterOrchestrator.tick() can drain it without itself becoming async.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import os
 import queue
 import threading
 import traceback
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Callable, Literal, Optional
+from typing import Literal
+
+from src.protocol.models import (  # noqa: F401 -- re-exported for existing callers
+    GESTURE_NAMES,
+    GestureName,
+)
+from src.protocol.tools import TOOL_ARG_MODELS
 
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000  # confirmed live: Live API's audio/pcm output mime rate
 
-# Measured live before committing to this pipeline: gemini-2.5-flash-
-# native-audio-preview-09-2025 landed ~1.7-2.2s to first audio on a warm,
-# already-open connection across repeated real turns (one cold-start
-# outlier hit 12s on a *fresh* connection, which is exactly why this
-# client connects once for the app's lifetime rather than per-turn). The
-# "-latest" alias tracks whichever current stable native-audio model that
-# preview graduates into, rather than a dated preview snapshot; it tested
-# with equivalent latency (~1.8s) against the same account/key.
-LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
-
-GestureName = Literal["nod", "shake_head", "excited", "curious", "think"]
-GESTURE_NAMES = frozenset({"nod", "shake_head", "excited", "curious", "think"})
+# Configurable via GEMINI_LIVE_MODEL. Measured live before picking this
+# default: gemini-3.8-live landed ~1.2s to first audio and correctly
+# waited on a Behavior.BLOCKING tool call before speaking (both confirmed
+# against the real API). gemini-2.5-flash-native-audio-latest (this
+# project's earlier default) also still works -- measured ~1.7-2.2s to
+# first audio on a warm connection -- and remains available via
+# GEMINI_LIVE_MODEL as a tested, documented fallback if gemini-3.8-live
+# is ever unavailable on a given account.
+LIVE_MODEL = os.environ.get("GEMINI_LIVE_MODEL", "gemini-3.8-live")
+LIVE_MODEL_FALLBACK = "gemini-2.5-flash-native-audio-latest"
 
 PERSONA = (
     "You are the voice of a small friendly desk lamp character (like "
@@ -68,25 +75,105 @@ PERSONA = (
     "- shake_head: disagreeing, saying no, correcting a mistaken assumption\n"
     "- excited: delighted, enthusiastic, celebrating something\n"
     "- curious: intrigued, asking a question back, puzzling over something\n"
-    "- think: briefly considering something before answering\n"
+    "- think: briefly considering something before answering\n\n"
+    "You have local memory of objects you've noticed. Never invent or "
+    "guess what you remember -- always call recall_memory when asked what "
+    "you've seen, noticed, or remember, and answer only from what it "
+    "returns. If asked to remember a specific object, call "
+    "request_observation(purpose=\"object_memory\") to get a fresh look, "
+    "then remember_object with that observation's id. Background "
+    "observations happen automatically -- don't narrate or mention them "
+    "unless the person actually asks about the scene.\n\n"
+    "When asked to find or act on something in the scene (e.g. \"find the "
+    "red mug and point at it\"), follow this exact sequence: call "
+    "request_observation(purpose=\"goal_planning\") first, always, even if "
+    "you already have an older observation -- never act on stale "
+    "information. Use the returned object coordinates with "
+    "look_at_image_point (and set_light if appropriate) to act. "
+    "Coordinates are approximate 2-D image positions, not precise 3-D "
+    "locations, so describe pointing/looking, not exact distances. After "
+    "acting, call request_observation(purpose=\"goal_verification\") to "
+    "check the result, then call finish_goal with that verification "
+    "observation's id -- never claim you completed a goal without "
+    "finish_goal succeeding; if it's rejected, adapt and try again rather "
+    "than insisting you already succeeded. If a tool call fails or "
+    "returns an error, acknowledge it plainly (e.g. \"I couldn't get a "
+    "clear look\") rather than pretending it worked. Distinguish "
+    "'I cannot get a clear view right now' from 'I looked and it is not "
+    "there' -- only say the second if a fresh observation actually didn't "
+    "show it."
 )
 
 
-def _gesture_tool_declaration() -> dict:
-    return {
-        "name": "perform_gesture",
-        "description": "Perform one bounded physical reaction gesture on the lamp's body.",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "name": {
-                    "type": "string",
-                    "enum": sorted(GESTURE_NAMES),
-                }
-            },
-            "required": ["name"],
-        },
-    }
+def _gemini_schema(value):
+    """Strips JSON-Schema constructs Gemini's function-declaration parser
+    doesn't accept (Pydantic emits $defs/title/additionalProperties that
+    a plain function-call schema has no use for), and translates a Literal
+    field's `const` into `enum` the same way. Mirrors a pattern confirmed
+    necessary in a reference Live implementation this pipeline draws on."""
+    if isinstance(value, dict):
+        unsupported = {"$defs", "additionalProperties", "title"}
+        translated = {k: _gemini_schema(v) for k, v in value.items() if k not in unsupported}
+        if "const" in translated:
+            translated["enum"] = [translated.pop("const")]
+        return translated
+    if isinstance(value, list):
+        return [_gemini_schema(v) for v in value]
+    return value
+
+
+TOOL_DESCRIPTIONS = {
+    "request_observation": (
+        "Capture and analyze a fresh frame from the lamp's camera. Always "
+        "call this before acting on or describing the current scene -- "
+        "never rely on an old observation for a new decision."
+    ),
+    "recall_memory": (
+        "Search locally remembered objects by a short text query. Always "
+        "use this instead of guessing when asked what you've seen, "
+        "noticed, or remember."
+    ),
+    "remember_object": (
+        "Store one specific object from a fresh observation into local "
+        "memory, so it can be recalled later."
+    ),
+    "look_at_image_point": (
+        "Point the lamp's head/arm toward a normalized 2-D position from "
+        "a specific observation. Approximate image-space pointing, not "
+        "precise 3-D localization."
+    ),
+    "set_light": "Adjust the lamp's own light brightness/mode.",
+    "perform_gesture": "Perform one bounded physical reaction gesture on the lamp's body.",
+    "finish_goal": (
+        "Report a goal's outcome. Only succeeds if a fresh goal_planning "
+        "observation, at least one action, and a fresh goal_verification "
+        "observation (captured after that action) were all recorded first."
+    ),
+}
+
+
+def _tool_declarations() -> list[dict]:
+    declarations = []
+    for name, model_cls in TOOL_ARG_MODELS.items():
+        parameters = _gemini_schema(model_cls.model_json_schema())
+        declarations.append(
+            {
+                "name": name,
+                "description": TOOL_DESCRIPTIONS[name],
+                "parameters": parameters,
+                # Gemini 3.8 Live's function calling is async by default;
+                # every one of these tools has a local invariant that must
+                # be satisfied *before* the model continues (a goal action
+                # ordered before its observation, or a hung turn waiting on
+                # a call we never actually answer) -- BLOCKING makes the
+                # model wait for the real result rather than guessing
+                # ahead. Confirmed live against gemini-3.8-live: the model
+                # correctly waited for a BLOCKING tool's response before
+                # producing any audio.
+                "behavior": "BLOCKING",
+            }
+        )
+    return declarations
 
 
 @dataclass
@@ -104,11 +191,11 @@ class LiveEvent:
         "interrupted",
         "error",
     ]
-    audio: Optional[bytes] = None
-    tool_name: Optional[str] = None
-    tool_args: Optional[dict] = None
-    tool_call_id: Optional[str] = None
-    message: Optional[str] = None
+    audio: bytes | None = None
+    tool_name: str | None = None
+    tool_args: dict | None = None
+    tool_call_id: str | None = None
+    message: str | None = None
 
 
 class GeminiLiveClient:
@@ -116,8 +203,8 @@ class GeminiLiveClient:
         self,
         model: str,
         api_key: str,
-        on_audio_chunk: Optional[Callable[[bytes], None]] = None,
-        on_debug: Optional[Callable[[str], None]] = None,
+        on_audio_chunk: Callable[[bytes], None] | None = None,
+        on_debug: Callable[[str], None] | None = None,
     ) -> None:
         self._model = model
         self._api_key = api_key
@@ -137,11 +224,11 @@ class GeminiLiveClient:
         self._on_audio_chunk = on_audio_chunk
         self._on_debug = on_debug or (lambda msg: None)
 
-        self._events: "queue.Queue[LiveEvent]" = queue.Queue()
-        self._mic_queue: "queue.Queue[bytes]" = queue.Queue(maxsize=200)
-        self._tool_results: "queue.Queue[tuple[str, str, dict]]" = queue.Queue()
-        self._text_nudges: "queue.Queue[str]" = queue.Queue()
-        self._commit_requests: "queue.Queue[None]" = queue.Queue()
+        self._events: queue.Queue[LiveEvent] = queue.Queue()
+        self._mic_queue: queue.Queue[bytes] = queue.Queue(maxsize=200)
+        self._tool_results: queue.Queue[tuple[str, str, dict]] = queue.Queue()
+        self._text_nudges: queue.Queue[str] = queue.Queue()
+        self._commit_requests: queue.Queue[None] = queue.Queue()
 
         self._mic_gate_open = threading.Event()
         self._connected = threading.Event()
@@ -162,8 +249,8 @@ class GeminiLiveClient:
         # session already carries context turn-to-turn on its own; this is
         # specifically for surviving the *reconnects* that were silently
         # wiping it.
-        self._history: "deque[tuple[str, str]]" = deque(maxlen=8)
-        self._last_context_nudge: Optional[str] = None
+        self._history: deque[tuple[str, str]] = deque(maxlen=8)
+        self._last_context_nudge: str | None = None
 
         self._thread = threading.Thread(target=self._thread_main, daemon=True)
         self._thread.start()
@@ -216,14 +303,10 @@ class GeminiLiveClient:
         try:
             self._mic_queue.put_nowait(pcm16_bytes)
         except queue.Full:
-            try:
+            with contextlib.suppress(queue.Empty):
                 self._mic_queue.get_nowait()
-            except queue.Empty:
-                pass
-            try:
+            with contextlib.suppress(queue.Full):
                 self._mic_queue.put_nowait(pcm16_bytes)
-            except queue.Full:
-                pass
 
     def notify_local_speech_started(self) -> None:
         """Called from the mic capture thread (see live_capture.py) the
@@ -266,8 +349,16 @@ class GeminiLiveClient:
                 break
         return events
 
-    def close(self) -> None:
+    def close(self, timeout_s: float = 2.0) -> None:
+        """Bounded shutdown: signals both loops to stop and joins the
+        background thread, but doesn't wait past timeout_s -- _receive_loop
+        can be blocked inside `async for response in session.receive()`
+        waiting on the next server message, which won't notice _stop until
+        the next message (or connection close) arrives. The thread is a
+        daemon (see __init__), so the process can still exit cleanly even
+        if this specific join times out."""
         self._stop.set()
+        self._thread.join(timeout=timeout_s)
 
     # -- background thread: owns its own asyncio event loop ------------------
 
@@ -289,16 +380,18 @@ class GeminiLiveClient:
         config = types.LiveConnectConfig(
             response_modalities=["AUDIO"],
             system_instruction=PERSONA,
-            tools=[{"function_declarations": [_gesture_tool_declaration()]}],
+            tools=[{"function_declarations": _tool_declarations()}],
             input_audio_transcription={},
             output_audio_transcription={},
         )
         delays = (0.5, 1.0, 2.0, 4.0)
         attempt = 0
         first_connect = True
+        active_model = self._model
+        fallback_attempted = False
         while not self._stop.is_set():
             try:
-                async with client.aio.live.connect(model=self._model, config=config) as session:
+                async with client.aio.live.connect(model=active_model, config=config) as session:
                     self._connected.set()
                     self._events.put(LiveEvent(kind="connected"))
                     self._on_debug("live session connected")
@@ -325,6 +418,22 @@ class GeminiLiveClient:
                 self._on_debug(f"live session error ({type(exc).__name__}), reconnecting: {exc}")
                 if self._stop.is_set():
                     return
+                if (
+                    not fallback_attempted
+                    and attempt >= 1
+                    and active_model != LIVE_MODEL_FALLBACK
+                ):
+                    # The configured/default model failed to connect twice
+                    # in a row -- fall back to the other model confirmed
+                    # live to work with this pipeline (see LIVE_MODEL's
+                    # docstring) rather than retrying the same broken
+                    # model indefinitely.
+                    self._on_debug(
+                        f"live: '{active_model}' failed repeatedly, falling back to "
+                        f"'{LIVE_MODEL_FALLBACK}'"
+                    )
+                    active_model = LIVE_MODEL_FALLBACK
+                    fallback_attempted = True
                 await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
                 attempt += 1
 

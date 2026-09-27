@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import os
 import time
-from typing import Callable, Optional, TypeVar
+from collections.abc import Callable
+from typing import TypeVar
 
 from google import genai
 
 # Free-tier-eligible Flash models (see .env.example / project README for
-# where to get a key: https://aistudio.google.com/apikey).
+# where to get a key: https://aistudio.google.com/apikey). All three are
+# configurable via environment variables so a different account/tier can
+# swap models without a code change; the literals below are only the
+# defaults, each chosen from a real, live-tested measurement, not from
+# documentation alone (Google's own docs were stale for at least one of
+# these -- see below).
 #
 # Superseded gemini-2.5-flash after confirming LIVE (not from docs, which
 # turned out stale) that it's capped at only 20 requests/day free tier --
@@ -28,7 +34,7 @@ from google import genai
 # spare, and is Google's own currently-recommended model -- the older
 # gemini-2.5-flash-lite is already a 404 for new users ("no longer
 # available... use gemini-3.5-flash-lite").
-VISION_MODEL = "gemini-3.5-flash-lite"
+VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
 
 # NOT gemini-2.5-flash-preview-tts -- confirmed live via a real
 # rate_limit_exceeded error (only surfaced after fixing error-swallowing;
@@ -41,7 +47,7 @@ VISION_MODEL = "gemini-3.5-flash-lite"
 # error-swallowing fix made the real rate_limit_exceeded message visible.
 # gemini-3.8-flash-lite-tts tested clean (real audio deltas, no error
 # event) against the same account/key.
-TTS_MODEL = "gemini-3.8-flash-lite-tts"
+TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
 
 _client: genai.Client | None = None
 
@@ -137,7 +143,7 @@ def call_with_retry(
     fn: Callable[[], _T],
     retries: int = 1,
     backoff_s: float = 1.0,
-    on_debug: Optional[Callable[[str], None]] = None,
+    on_debug: Callable[[str], None] | None = None,
 ) -> _T:
     """Runs fn() and retries on a client-side timeout.
 
@@ -158,7 +164,7 @@ def call_with_retry(
     for attempt in range(retries + 1):
         try:
             return fn()
-        except Exception as exc:  # noqa: BLE001 -- inspecting, not swallowing
+        except Exception as exc:
             if not _is_retryable(exc) or attempt == retries:
                 raise
             last_exc = exc

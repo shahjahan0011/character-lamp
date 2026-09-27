@@ -1,53 +1,79 @@
-"""Scene understanding via Gemini vision -- demo moment 4 (scene memory).
+"""Scene understanding via Gemini vision -- demo moment 4 (scene memory)
+and the perception half of goal-directed action (demo moment 5).
 
-One frame per call. Originally triggered once per engagement; now also
-called periodically while engaged (see CharacterOrchestrator's re-
-observation timer) so the lamp notices *changes* in its surroundings, not
-just whatever was in view the instant someone first looked at it.
+One frame per call. Uses response_format's JSON-schema constraint
+(confirmed live: interactions.create() supports
+response_format={"type": "text", "mime_type": "application/json",
+"schema": {...}}) rather than a free-text-plus-regex parser -- also
+confirmed live, grounding normalized image_x/image_y this way against a
+test image with known object positions landed within ~1% of the computed
+true center, which a label/attribute-only parser had no way to produce at
+all. Falls back to returning an empty object list (not a crash) if the
+model's response fails schema validation, since a single bad observation
+shouldn't be worse than "saw nothing this time."
 
-The prompt was originally scoped to "notable, non-furniture" objects only,
-which in practice meant an ordinary desk/office scene often came back
-empty (confirmed live: "saw 0 object(s): []" against real rooms) -- not
-useful for "describe what's around you". Broadened to general surroundings
-(furniture included), still capped at a handful of items so memory/context
-stays compact.
+Frames are never persisted here -- the caller (SceneObserver) passes a
+frame already in memory and this module only ever sends bytes to Gemini,
+never writes them to disk.
 """
 
 from __future__ import annotations
 
 import base64
-import re
-from dataclasses import dataclass
+import json
+import time
+import uuid
 
 import cv2
 import numpy as np
+from pydantic import ValidationError
+
+from src.protocol.observation import DetectedObject, Observation, ObservationPurpose
 
 from .gemini_client import VISION_MODEL, collect_text_stream, get_client
 
 DESCRIBE_PROMPT = (
-    "Look at this image from a small desk lamp's webcam. Describe up to 5 "
+    "Look at this image from a small desk lamp's webcam. Describe up to 6 "
     "notable things you can see in the surroundings -- furniture, objects "
     "on a desk or shelf, decor, anything a person might ask 'what's around "
-    "you?' or 'what does it look like in here?' about. Skip people "
-    "themselves and pure background (bare walls/floor with nothing on "
-    "them). For each, give a short label and 1-2 key visual attributes "
-    "(color, shape, material, position like 'on the left'). Respond with "
-    "ONE item per line, in EXACTLY this format, nothing else:\n"
-    "LABEL: <short name> | ATTRIBUTES: <comma-separated attributes>\n"
-    "If there is truly nothing describable in view, respond with exactly: "
-    "NONE"
+    "you?' or 'what does it look like in here?' about, or might later ask "
+    "you to point at. Skip people themselves and pure background (bare "
+    "walls/floor with nothing on them).\n\n"
+    "For each object give: a short label, 1-2 key visual attributes "
+    "(shape, material, position), an optional single dominant color word, "
+    "its approximate CENTER position as image_x/image_y normalized so "
+    "0.0 is the left/top edge and 1.0 is the right/bottom edge, and your "
+    "confidence 0.0-1.0 that the label and position are correct. If "
+    "there is truly nothing describable in view, return an empty list."
 )
 
-_OBJECT_RE = re.compile(r"LABEL:\s*(.+?)\s*\|\s*ATTRIBUTES:\s*(.+)", re.IGNORECASE)
+_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "objects": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "attributes": {"type": "string"},
+                    "color": {"type": "string"},
+                    "image_x": {"type": "number"},
+                    "image_y": {"type": "number"},
+                    "confidence": {"type": "number"},
+                },
+                "required": ["label", "attributes", "image_x", "image_y", "confidence"],
+            },
+        }
+    },
+    "required": ["objects"],
+}
 
 
-@dataclass
-class ObservedObject:
-    label: str
-    attributes: str
-
-
-def describe_scene(frame_bgr: np.ndarray, timeout_s: float = 30.0) -> list[ObservedObject]:
+def describe_scene(
+    frame_bgr: np.ndarray, purpose: ObservationPurpose = "scene", timeout_s: float = 30.0
+) -> Observation:
+    height, width = frame_bgr.shape[:2]
     ok, jpeg = cv2.imencode(".jpg", frame_bgr)
     if not ok:
         raise RuntimeError("Failed to JPEG-encode the frame")
@@ -63,18 +89,36 @@ def describe_scene(frame_bgr: np.ndarray, timeout_s: float = 30.0) -> list[Obser
                 "mime_type": "image/jpeg",
             },
         ],
+        response_format={"type": "text", "mime_type": "application/json", "schema": _RESPONSE_SCHEMA},
         stream=True,
         timeout=timeout_s,
     )
-    return _parse_objects(collect_text_stream(stream))
+    raw = collect_text_stream(stream)
+    objects = _parse_objects(raw)
+    return Observation(
+        observation_id=uuid.uuid4().hex,
+        captured_at_monotonic=time.monotonic(),
+        purpose=purpose,
+        width=width,
+        height=height,
+        objects=objects,
+    )
 
 
-def _parse_objects(text: str) -> list[ObservedObject]:
-    if text.strip().upper() == "NONE":
+def _parse_objects(raw: str) -> list[DetectedObject]:
+    try:
+        payload = json.loads(raw)
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, dict):
         return []
     objects = []
-    for line in text.splitlines():
-        match = _OBJECT_RE.search(line)
-        if match:
-            objects.append(ObservedObject(label=match.group(1).strip(), attributes=match.group(2).strip()))
+    for item in payload.get("objects", []):
+        try:
+            objects.append(DetectedObject.model_validate(item))
+        except ValidationError:
+            # Reject the one malformed/out-of-range entry, not the whole
+            # observation -- one bad object shouldn't discard everything
+            # else the model correctly saw in the same frame.
+            continue
     return objects

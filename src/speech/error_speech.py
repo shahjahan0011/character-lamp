@@ -16,7 +16,7 @@ handful of short phrases synthesized once costs very little.
 from __future__ import annotations
 
 import io
-from typing import Callable, Optional
+from collections.abc import Callable
 
 import numpy as np
 import soundfile as sf
@@ -35,7 +35,7 @@ class ErrorSpeech:
     """Pre-synthesizes PHRASES once (see preload()) and plays a cached one
     on demand (see say()) -- never makes a network call from say() itself."""
 
-    def __init__(self, mixer: AudioMixer, on_debug: Optional[Callable[[str], None]] = None):
+    def __init__(self, mixer: AudioMixer, on_debug: Callable[[str], None] | None = None):
         self._mixer = mixer
         self._on_debug = on_debug or (lambda msg: None)
         self._clips: dict[str, tuple[np.ndarray, int]] = {}
