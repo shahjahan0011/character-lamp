@@ -50,6 +50,20 @@ from src.speech.live_client import GESTURE_NAMES, GeminiLiveClient, LiveEvent
 # "having trouble connecting" is a useful cue, four in ten seconds is not.
 CONNECTION_ERROR_ANNOUNCE_COOLDOWN_S = 20.0
 
+# Every ActionKind that goes through ActionExecutor._move_and_settle()'s
+# blocking sleep-and-step loop -- used only to correlate audio xruns
+# against real movement telemetry (see _report_failures).
+MOVEMENT_ACTION_KINDS = frozenset(
+    {"look_at", "point_at", "nod", "shake_head", "excited", "curious", "think", "home", "idle_sway"}
+)
+
+# Measured live: this project's OutputStream reports ~144ms of hardware
+# buffer latency regardless of the `latency` setting passed to it -- a
+# real gap between "our software queue emptied" and "the speaker is
+# actually silent". Reopening the mic gate immediately on queue-empty
+# risks picking up that trailing ~144ms of the lamp's own voice.
+MIC_REOPEN_GRACE_S = 0.25
+
 MAX_PAN_RAD = 0.7  # radians; matches base_yaw_joint's usable range for a look
 
 WARM_WHITE = [1.0, 0.95, 0.76]
@@ -139,6 +153,7 @@ class CharacterOrchestrator:
         self._awaiting_first_audio = False
         self._next_reobserve_at = 0.0
         self._nudged_this_engagement = False
+        self._output_drained_at: Optional[float] = None
         # Starts disengaged, so the idle music starts playing immediately.
         self.executor.run(Action(kind="music_on", params={}))
 
@@ -297,10 +312,23 @@ class CharacterOrchestrator:
     def _update_mic_gate(self, currently_engaged: bool) -> None:
         """Recomputed every tick from live state rather than a guessed mute
         duration: open only while engaged, no turn in flight, and nothing
-        the mixer is currently playing (speech/SFX/music) could be picked
-        back up by the mic."""
+        the mixer's *software queue* is currently holding (speech/SFX/
+        music). That queue emptying isn't quite the same moment as the
+        speaker actually falling silent, though -- measured this output
+        stream's own reported hardware buffer latency at ~144ms, a real
+        gap during which the mic could reopen and pick up the tail end of
+        the lamp's own voice. MIC_REOPEN_GRACE_S adds a fixed delay after
+        the queue empties before actually reopening, to cover that gap."""
         output_pending = self.audio_mixer.output_pending if self.audio_mixer is not None else False
-        should_be_open = currently_engaged and not self._turn_in_flight and not output_pending
+        if output_pending:
+            self._output_drained_at = None
+        elif self._output_drained_at is None:
+            self._output_drained_at = time.time()
+        drained_long_enough = (
+            self._output_drained_at is not None
+            and time.time() - self._output_drained_at >= MIC_REOPEN_GRACE_S
+        )
+        should_be_open = currently_engaged and not self._turn_in_flight and drained_long_enough
         self.live_client.set_mic_gate(should_be_open)
 
     # -- scene memory ----------------------------------------------------------
@@ -371,9 +399,32 @@ class CharacterOrchestrator:
         )
 
     def _report_failures(self) -> None:
+        recent_movement = None
         for t in self.executor.drain_telemetry():
             if t.kind == "action_failed":
                 self._on_debug(f"ACTION FAILED: {t.payload}")
+            elif t.kind == "action_done" and t.payload.get("kind") in MOVEMENT_ACTION_KINDS:
+                recent_movement = t.payload
+        if self.audio_mixer is not None:
+            underflow, overflow = self.audio_mixer.pop_xrun_counts()
+            if underflow or overflow:
+                # Real PortAudio-reported xruns (not a guess) -- logging
+                # whether one coincided with a movement action this same
+                # tick is exactly the evidence needed to confirm or rule
+                # out "audio glitches happen because of gestures" as
+                # opposed to gestures and speech simply always co-occurring
+                # by design (Gemini calls gestures mid-reply).
+                if recent_movement is not None:
+                    self._on_debug(
+                        f"AUDIO XRUN: underflow={underflow} overflow={overflow} -- "
+                        f"coincided with movement '{recent_movement['kind']}' "
+                        f"({recent_movement['elapsed_s'] * 1000:.0f}ms)"
+                    )
+                else:
+                    self._on_debug(
+                        f"AUDIO XRUN: underflow={underflow} overflow={overflow} "
+                        "(no movement action this tick)"
+                    )
 
     def _on_engage(self, face_x_frac: float) -> None:
         pan = -face_x_frac * MAX_PAN_RAD

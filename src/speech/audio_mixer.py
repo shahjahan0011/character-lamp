@@ -70,6 +70,14 @@ class AudioMixer:
         # within the 5s latency budget.
         self._prime_samples = int(prime_s * sample_rate)
         self._priming = True
+        # sounddevice/PortAudio already reports real xruns via the
+        # callback's `status` argument -- never previously read. Counting
+        # them (rather than guessing from symptoms) is how to actually
+        # confirm or rule out "buffer underrun" as the cause of an audio
+        # glitch, and to correlate it against gesture timing (see
+        # pop_xrun_counts() and fsm.py's use of it).
+        self._underflow_count = 0
+        self._overflow_count = 0
 
     def start(self) -> None:
         if self._stream is not None:
@@ -104,6 +112,10 @@ class AudioMixer:
         return output
 
     def _callback(self, outdata, frames, time_info, status) -> None:
+        if status.output_underflow:
+            self._underflow_count += 1
+        if status.output_overflow:
+            self._overflow_count += 1
         with self._lock:
             if self._priming:
                 buffered = sum(len(c) for c in self._speech)
@@ -179,6 +191,14 @@ class AudioMixer:
         """Whether Gemini's speech is still waiting to be played out."""
         with self._lock:
             return bool(self._speech)
+
+    def pop_xrun_counts(self) -> tuple[int, int]:
+        """Non-blocking poll: real (underflow, overflow) counts from
+        PortAudio since the last call, for correlating against gesture
+        timing (see fsm.py) instead of guessing from symptoms alone."""
+        underflow, self._underflow_count = self._underflow_count, 0
+        overflow, self._overflow_count = self._overflow_count, 0
+        return underflow, overflow
 
     @property
     def output_pending(self) -> bool:
