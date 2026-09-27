@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import cv2
 import numpy as np
 
-from .gemini_client import TEXT_MODEL, collect_text_stream, get_client
+from .gemini_client import VISION_MODEL, collect_text_stream, get_client
 
 DESCRIBE_PROMPT = (
     "Look at this image from a small desk lamp's webcam. Describe up to 5 "
@@ -54,7 +54,7 @@ def describe_scene(frame_bgr: np.ndarray, timeout_s: float = 30.0) -> list[Obser
 
     client = get_client()
     stream = client.interactions.create(
-        model=TEXT_MODEL,
+        model=VISION_MODEL,
         input=[
             {"type": "text", "text": DESCRIBE_PROMPT},
             {

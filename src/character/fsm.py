@@ -42,7 +42,13 @@ from src.character.scene_observer import SceneObserver
 from src.perception.engagement import EngagementWatcher
 from src.protocol.models import Action
 from src.speech.audio_mixer import AudioMixer
+from src.speech.error_speech import ErrorSpeech
 from src.speech.live_client import GESTURE_NAMES, GeminiLiveClient, LiveEvent
+
+# Don't re-announce a connection problem on every retry within a fast
+# reconnect loop (0.5s/1s/2s/4s backoff, see live_client.py) -- one
+# "having trouble connecting" is a useful cue, four in ten seconds is not.
+CONNECTION_ERROR_ANNOUNCE_COOLDOWN_S = 20.0
 
 MAX_PAN_RAD = 0.7  # radians; matches base_yaw_joint's usable range for a look
 
@@ -71,10 +77,20 @@ TURN_TIMEOUT_S = 20.0
 # How often to re-look at the surroundings while engaged, not just once at
 # the moment of engagement -- so the lamp can notice something changed
 # (a new object appeared/moved) instead of only ever describing whatever
-# was in view the instant someone first looked at it. Long enough to not
-# burn through the vision-call quota needlessly; short enough that a
-# demo showing "it notices things changed" doesn't require a long wait.
-REOBSERVE_INTERVAL_S = 15.0
+# was in view the instant someone first looked at it.
+#
+# Confirmed live at 15s: a vision-model free-tier quota of 20 requests/day
+# gets exhausted within about 5 minutes of continuous engagement, and every
+# failed retry afterward hammered the same already-exhausted quota. 45s
+# keeps re-observation "constant"/"regular" for a demo while giving a
+# 20/day cap roughly 15 engaged minutes before running out -- plenty for
+# any one continuous demo session, not infinite for an all-day dev loop.
+REOBSERVE_INTERVAL_S = 45.0
+# Backing off this much longer after a rate/quota failure (see
+# pop_rate_limited()) means one exhausted-quota moment produces one
+# retry-and-back-off, not a new failed attempt (and traceback) every
+# single normal interval until the quota resets.
+REOBSERVE_BACKOFF_S = 300.0
 
 # While nobody's engaged, the lamp wanders on its own every so often --
 # otherwise it just sits frozen, which reads as "off" rather than "alive but
@@ -93,12 +109,15 @@ class CharacterOrchestrator:
         audio_mixer: Optional[AudioMixer] = None,
         observer: Optional[SceneObserver] = None,
         memory: Optional[SceneMemory] = None,
+        error_speech: Optional[ErrorSpeech] = None,
         on_debug: Optional[Callable[[str], None]] = None,
     ):
         self.executor = executor
         self.watcher = watcher
         self.live_client = live_client
         self.audio_mixer = audio_mixer
+        self.error_speech = error_speech
+        self._last_connection_error_announced_at = 0.0
         # Optional hook for tests/scripts to print what's happening -- the
         # executor swallows action exceptions into telemetry by design (one
         # bad action shouldn't kill the demo), which otherwise means a
@@ -119,7 +138,7 @@ class CharacterOrchestrator:
         self._turn_deadline = 0.0
         self._awaiting_first_audio = False
         self._next_reobserve_at = 0.0
-        self._last_nudged_labels: frozenset[str] = frozenset()
+        self._nudged_this_engagement = False
         # Starts disengaged, so the idle music starts playing immediately.
         self.executor.run(Action(kind="music_on", params={}))
 
@@ -157,6 +176,7 @@ class CharacterOrchestrator:
         # and observation results can arrive at any moment, independent of
         # whatever else is happening.
         if self.live_client is not None:
+            self.live_client.set_engaged(state.engaged)
             self._drain_live_events(state.engaged)
             self._check_turn_timeout(state.engaged)
             self._check_thinking_pulse()
@@ -182,7 +202,7 @@ class CharacterOrchestrator:
             elif event.kind == "speech_committed":
                 self._on_turn_started()
             elif event.kind == "audio_chunk":
-                self._on_audio_chunk(event.audio, currently_engaged)
+                self._on_audio_chunk(currently_engaged)
             elif event.kind == "tool_call":
                 self._on_tool_call(event)
             elif event.kind == "turn_complete":
@@ -192,6 +212,11 @@ class CharacterOrchestrator:
                 self._on_debug("live: playback interrupted (barge-in)")
             elif event.kind == "error":
                 self._on_debug(f"live: error: {event.message}")
+                if currently_engaged and self.error_speech is not None:
+                    now = time.time()
+                    if now - self._last_connection_error_announced_at >= CONNECTION_ERROR_ANNOUNCE_COOLDOWN_S:
+                        self._last_connection_error_announced_at = now
+                        self.error_speech.say("connection")
 
     def _on_turn_started(self) -> None:
         """Local silence detection just committed the user's utterance
@@ -208,21 +233,21 @@ class CharacterOrchestrator:
         self.executor.run(Action(kind="play_sound", params={"name": "thinking_hum.wav"}))
         self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
 
-    def _on_audio_chunk(self, pcm_bytes: Optional[bytes], currently_engaged: bool) -> None:
-        if pcm_bytes is None or self.audio_mixer is None:
-            return
+    def _on_audio_chunk(self, currently_engaged: bool) -> None:
+        """The actual audio bytes are fed to the mixer directly from
+        GeminiLiveClient's own receive thread (see live_client.py's
+        __init__ docstring for why -- this used to route through here,
+        which meant a blocked main thread, e.g. mid-gesture, starved the
+        mixer of new audio). This handler only reacts to the *event* for
+        the "first audio of this turn arrived" lighting cue; the
+        engagement check that gates whether audio actually plays lives in
+        GeminiLiveClient.set_engaged(), called every tick below."""
         if not currently_engaged:
-            # Only listen or reply while engaged -- drop audio that arrives
-            # after the person's already looked away rather than playing a
-            # reply into an empty room. The model may keep generating
-            # server-side (there's no clean client-initiated cancel), but
-            # nothing plays or reacts on our end once disengaged.
             return
         if self._awaiting_first_audio:
             self._awaiting_first_audio = False
             self._turn_deadline = time.time() + TURN_TIMEOUT_S  # still speaking; extend the watchdog
             self._restore_engaged_light()
-        self.audio_mixer.enqueue_speech_pcm16(pcm_bytes)
 
     def _on_tool_call(self, event: LiveEvent) -> None:
         name = (event.tool_args or {}).get("name")
@@ -255,6 +280,8 @@ class CharacterOrchestrator:
         if currently_engaged:
             self.executor.run(Action(kind="shake_head", params={}))
             self._restore_engaged_light()
+            if self.error_speech is not None:
+                self.error_speech.say("timeout")
 
     def _check_thinking_pulse(self) -> None:
         """A slow, repeated 'pondering' dip while a reply is in flight but
@@ -297,18 +324,32 @@ class CharacterOrchestrator:
             # unlike a failed spoken turn, there's no waiting conversational
             # turn to visibly resolve.
             self._on_debug("scene observer: last observation failed")
+            if self.observer.pop_rate_limited():
+                self._next_reobserve_at = time.time() + REOBSERVE_BACKOFF_S
+                self._on_debug(
+                    f"scene observer: rate-limited, backing off {REOBSERVE_BACKOFF_S:.0f}s"
+                )
         result = self.observer.pop_new_observation()
         if result is None:
             return
         objects, changed = result
-        current_labels = frozenset(o.label.lower() for o in objects)
-        # Only relay a nudge when the observed set actually differs from
-        # the last one we relayed -- re-observing an unchanged desk every
-        # ~15s shouldn't repeat the same "here's what you've seen" text
-        # into the live conversation's context each time.
-        if not changed and current_labels == self._last_nudged_labels:
+        # Confirmed live: injecting scene-memory text mid-conversation via
+        # send_realtime_input(text=...) makes Gemini speak in response
+        # EVERY time, even with an explicit "don't say anything, this is
+        # silent" instruction in the text itself -- that's what "randomly
+        # started describing the scenery" turned out to be. The Live API
+        # also explicitly warns against mixing send_client_content (whose
+        # turn_complete=False *would* inject silently) with the continuous
+        # send_realtime_input audio streaming this pipeline already
+        # depends on. Given that, only relay a nudge once per engagement
+        # (right after the first observation completes) rather than on
+        # every periodic re-observation -- local memory still updates
+        # continuously either way (see _check_reobserve), so a later
+        # question is answered from whatever's freshest in self.memory;
+        # it just isn't volunteered mid-conversation on its own.
+        if self._nudged_this_engagement:
             return
-        self._last_nudged_labels = current_labels
+        self._nudged_this_engagement = True
         if self.live_client is not None:
             self.live_client.send_text_nudge(self.memory.as_context_text())
 
@@ -353,6 +394,7 @@ class CharacterOrchestrator:
         )
         # Mic gate opens on the next tick via _update_mic_gate (engaged,
         # no turn in flight, nothing playing) -- no separate call needed.
+        self._nudged_this_engagement = False
         self._observe_scene()
         self._next_reobserve_at = time.time() + REOBSERVE_INTERVAL_S
 

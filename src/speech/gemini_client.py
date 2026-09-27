@@ -19,17 +19,16 @@ from google import genai
 # Free-tier-eligible Flash models (see .env.example / project README for
 # where to get a key: https://aistudio.google.com/apikey).
 #
-# Deliberately NOT the newest "gemini-3.8-flash" -- hit its free-tier
-# quota live (confirmed via a real 429): only ~20 requests/day. gemini-2.5-
-# flash is the previous Flash generation and gets a far more generous
-# free-tier allowance (hundreds to 1500+ requests/day depending on when
-# Google's own docs were last updated) while still supporting the same
-# audio-in/audio-out interactions.create() calls this project relies on.
-# Given development alone burns through single-digit-to-dozens of calls
-# per session, 20/day is not workable; recheck current per-model limits
-# at https://ai.google.dev/gemini-api/docs/rate-limits before changing
-# this again.
-TEXT_MODEL = "gemini-2.5-flash"
+# Superseded gemini-2.5-flash after confirming LIVE (not from docs, which
+# turned out stale) that it's capped at only 20 requests/day free tier --
+# a real rate_limit_exceeded hit repeatedly during a session that also
+# re-observes the scene every ~15s while engaged, exhausting the day's
+# quota within minutes. gemini-3.5-flash-lite tested clean (correct scene
+# description, no error event) against the same account/key with quota to
+# spare, and is Google's own currently-recommended model -- the older
+# gemini-2.5-flash-lite is already a 404 for new users ("no longer
+# available... use gemini-3.5-flash-lite").
+VISION_MODEL = "gemini-3.5-flash-lite"
 
 # NOT gemini-2.5-flash-preview-tts -- confirmed live via a real
 # rate_limit_exceeded error (only surfaced after fixing error-swallowing;

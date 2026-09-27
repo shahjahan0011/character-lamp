@@ -74,10 +74,13 @@ class SceneMemory:
             return "You have not noticed any objects nearby yet."
         lines = [f"- {e.label}: {e.attributes}" for e in self._entries]
         return (
-            "Specific objects you have personally noticed nearby (use these "
-            "by name if asked what you've seen/noticed -- treat this as "
-            "everything currently in view, don't say you haven't seen "
-            "anything if this list is non-empty):\n" + "\n".join(lines)
+            "(Silent background update -- do not say anything about this "
+            "now, do not narrate or announce it out loud. Just privately "
+            "note it for later.) Specific objects you have personally "
+            "noticed nearby (use these by name if the person actually "
+            "asks what you've seen/noticed -- treat this as everything "
+            "currently in view, don't say you haven't seen anything if "
+            "this list is non-empty):\n" + "\n".join(lines)
         )
 
     def __len__(self) -> int:

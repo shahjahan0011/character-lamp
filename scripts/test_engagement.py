@@ -36,6 +36,7 @@ from src.character.fsm import CharacterOrchestrator
 from src.character.memory import SceneMemory
 from src.perception.engagement import EngagementWatcher
 from src.speech.audio_mixer import AudioMixer
+from src.speech.error_speech import ErrorSpeech
 from src.speech.live_capture import LiveMicStreamer
 from src.speech.live_client import LIVE_MODEL, OUTPUT_SAMPLE_RATE, GeminiLiveClient
 from src.speech.playback import make_audio_hooks
@@ -64,9 +65,17 @@ def main() -> None:
 
     live_client = None
     mic_streamer = None
+    error_speech = None
     if api_key:
-        live_client = GeminiLiveClient(LIVE_MODEL, api_key, on_debug=print)
+        live_client = GeminiLiveClient(
+            LIVE_MODEL, api_key, on_audio_chunk=mixer.enqueue_speech_pcm16, on_debug=print
+        )
         mic_streamer = LiveMicStreamer(live_client, on_debug=print)
+        # Pre-synthesized now, not on demand -- see error_speech.py's
+        # docstring for why (the moment this is needed may be the moment a
+        # fresh network call is least likely to succeed quickly).
+        error_speech = ErrorSpeech(mixer, on_debug=print)
+        error_speech.preload()
 
     print("Starting camera and microphone...")
     watcher.start()
@@ -82,7 +91,13 @@ def main() -> None:
 
     memory = SceneMemory()
     orchestrator = CharacterOrchestrator(
-        executor, watcher, live_client=live_client, audio_mixer=mixer, memory=memory, on_debug=print
+        executor,
+        watcher,
+        live_client=live_client,
+        audio_mixer=mixer,
+        memory=memory,
+        error_speech=error_speech,
+        on_debug=print,
     )
     try:
         orchestrator.run_forever(poll_hz=10.0)

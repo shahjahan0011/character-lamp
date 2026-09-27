@@ -21,8 +21,10 @@ import numpy as np
 
 from src.character.memory import SceneMemory
 from src.speech import vision
-from src.speech.gemini_client import call_with_retry
+from src.speech.gemini_client import GeminiStreamError, call_with_retry
 from src.speech.vision import ObservedObject
+
+_RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "quota_exceeded", "too_many_requests"})
 
 
 @dataclass
@@ -44,6 +46,7 @@ class SceneObserver:
         self._result_lock = threading.Lock()
         self._new_observation: Optional[tuple[list[ObservedObject], bool]] = None
         self._failed = False
+        self._rate_limited = False
 
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
@@ -81,16 +84,30 @@ class SceneObserver:
             failed, self._failed = self._failed, False
         return failed
 
+    def pop_rate_limited(self) -> bool:
+        """Non-blocking poll: whether the last failure was specifically a
+        rate/quota limit (vs. some other error) -- lets the caller back off
+        the next re-observation much further out instead of retrying on
+        the normal cadence and hitting the same wall again immediately.
+        Confirmed live: re-observing every ~15s exhausted a 20-requests/day
+        vision-model quota within minutes; a caller needs to know *why* it
+        failed to react proportionately."""
+        with self._result_lock:
+            rate_limited, self._rate_limited = self._rate_limited, False
+        return rate_limited
+
     def _run(self) -> None:
         while True:
             job = self._input.get()
             self._busy.set()
             try:
                 self._process(job)
-            except Exception:  # noqa: BLE001 -- one bad observation shouldn't kill the worker
+            except Exception as exc:  # noqa: BLE001 -- one bad observation shouldn't kill the worker
                 self._on_debug(f"scene observer error:\n{traceback.format_exc()}")
+                is_rate_limit = isinstance(exc, GeminiStreamError) and exc.code in _RATE_LIMIT_CODES
                 with self._result_lock:
                     self._failed = True
+                    self._rate_limited = is_rate_limit
             finally:
                 self._busy.clear()
 

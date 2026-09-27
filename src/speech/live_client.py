@@ -116,10 +116,25 @@ class GeminiLiveClient:
         self,
         model: str,
         api_key: str,
+        on_audio_chunk: Optional[Callable[[bytes], None]] = None,
         on_debug: Optional[Callable[[str], None]] = None,
     ) -> None:
         self._model = model
         self._api_key = api_key
+        # Called directly from the async receive-loop thread the instant a
+        # chunk arrives -- confirmed live to be the fix for audio glitches
+        # ("farting") specifically during gestures: gesture playback blocks
+        # the *main* thread for its whole duration (ActionExecutor's
+        # trajectory loop sleeps and steps PyBullet synchronously), and
+        # audio used to only reach AudioMixer via that same main thread
+        # (CharacterOrchestrator.tick() polling poll_events() and calling
+        # enqueue_speech_pcm16()). A blocked main thread meant no new audio
+        # reached the mixer for the gesture's whole duration, starving the
+        # real-time output callback -- exactly when a gesture (like the
+        # reactive ones Gemini calls mid-reply) was most likely to be
+        # playing. Feeding the mixer from here instead means it keeps
+        # getting fed regardless of what the main thread is doing.
+        self._on_audio_chunk = on_audio_chunk
         self._on_debug = on_debug or (lambda msg: None)
 
         self._events: "queue.Queue[LiveEvent]" = queue.Queue()
@@ -131,6 +146,12 @@ class GeminiLiveClient:
         self._mic_gate_open = threading.Event()
         self._connected = threading.Event()
         self._stop = threading.Event()
+        # Separate from mic gating (which also closes mid-turn/mid-
+        # playback while still engaged) -- this specifically answers "is
+        # anyone currently engaged at all", so a reply that finishes
+        # arriving after they've looked away doesn't get played into an
+        # empty room.
+        self._engaged = threading.Event()
 
         # A bounded rolling transcript, built from the input/output
         # transcription Gemini already sends us (config requests it, but
@@ -157,6 +178,16 @@ class GeminiLiveClient:
 
     def is_mic_gate_open(self) -> bool:
         return self._mic_gate_open.is_set()
+
+    def set_engaged(self, engaged: bool) -> None:
+        """Called once per tick from CharacterOrchestrator -- gates the
+        direct-to-mixer audio feed (see __init__) so audio still only ever
+        plays while someone's actually engaged, even though it no longer
+        routes through fsm.py's own engagement check."""
+        if engaged:
+            self._engaged.set()
+        else:
+            self._engaged.clear()
 
     def set_mic_gate(self, open_: bool) -> None:
         if open_:
@@ -391,7 +422,17 @@ class GeminiLiveClient:
                         for part in content.model_turn.parts:
                             inline = getattr(part, "inline_data", None)
                             if inline and inline.data:
-                                self._events.put(LiveEvent(kind="audio_chunk", audio=inline.data))
+                                # Fed to the mixer directly, from this
+                                # thread, right now -- not routed through
+                                # poll_events()/tick(), which can be
+                                # blocked for a gesture's whole duration
+                                # (see __init__'s docstring). The event is
+                                # still published (without the bytes) so
+                                # fsm.py can react to "first audio of this
+                                # turn arrived" for the lighting cue.
+                                if self._on_audio_chunk is not None and self._engaged.is_set():
+                                    self._on_audio_chunk(inline.data)
+                                self._events.put(LiveEvent(kind="audio_chunk"))
                     tool_call = getattr(response, "tool_call", None)
                     if tool_call:
                         for call in tool_call.function_calls:
