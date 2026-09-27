@@ -1,23 +1,22 @@
 """Live test: opens the lamp in a GUI window, your webcam, and your
 microphone. Sit in frame -> music stops, a chime plays, it turns toward
 you, nods, flashes then brightens, and starts listening. Say something ->
-after it stops hearing you talk, the light turns a cool blue ("thinking")
-while it understands + replies + synthesizes speech in the background --
-this genuinely takes 30-60+ seconds on the free tier, but the character
-stays fully responsive the whole time (you can still disengage, and it
-will wander/react normally) since none of that runs on the main loop.
-Once ready, it reacts (nod/shake_head/excited/curious) and speaks the
-reply. Look away at any point -> it stops listening, dims, returns home,
-and the idle music resumes; a reply that finishes after you've looked
-away is dropped rather than spoken into an empty room.
+local silence detection commits your utterance to a persistent Gemini
+Live session; a short "thinking" cue (blue light + hum + pondering
+gesture) plays until the reply's audio starts arriving, then it speaks
+while reacting with whatever gesture it calls (nod/shake_head/excited/
+curious/think) -- measured live, first audio lands ~1.7-2.2s after your
+utterance is committed, not the 30-90+ seconds the old per-utterance
+request/response pipeline took. Look away at any point -> it stops
+listening, dims, returns home, and the idle music resumes; a reply still
+in flight keeps playing into the room rather than being dropped. Right
+after it engages, it also takes one look at whatever's in front of the
+camera and remembers it (demo moment 4) -- ask it later what it's seen.
 
 Requires GEMINI_API_KEY in a local .env (copy .env.example, add your key
-from https://aistudio.google.com/apikey -- no credit card needed) for the
-understand/reply/speech steps. Engagement, motion, light, and music all
-work without a key. Free tier: gemini-2.5-flash gets a much more generous
-daily quota than the newest gemini-3.8-flash (confirmed live: the latter
-caps out at ~20 requests/day, easy to exhaust just testing) -- see
-gemini_client.py before changing models.
+from https://aistudio.google.com/apikey -- no credit card needed) for
+conversation and scene memory. Engagement, motion, light, and music all
+work without a key.
 
 Usage: .venv/bin/python scripts/test_engagement.py
 Ctrl+C to quit. macOS will prompt for camera and microphone permission the
@@ -34,35 +33,66 @@ from dotenv import load_dotenv
 from src.body.executor import ActionExecutor, ExecutorHooks
 from src.body.sim import LampSimulator
 from src.character.fsm import CharacterOrchestrator
+from src.character.memory import SceneMemory
 from src.perception.engagement import EngagementWatcher
-from src.speech.capture import SpeechCapture
+from src.speech.audio_mixer import AudioMixer
+from src.speech.live_capture import LiveMicStreamer
+from src.speech.live_client import LIVE_MODEL, OUTPUT_SAMPLE_RATE, GeminiLiveClient
 from src.speech.playback import make_audio_hooks
 
 
 def main() -> None:
     load_dotenv()
-    has_key = bool(os.environ.get("GEMINI_API_KEY"))
-    if not has_key:
-        print("No GEMINI_API_KEY found -- speech will listen and log utterances,")
-        print("but transcription/reply/speaking will fail (add .env to enable).")
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("No GEMINI_API_KEY found -- conversation and scene memory will be")
+        print("disabled (add .env to enable). Engagement, motion, light, and")
+        print("music all work without a key.")
 
     sim = LampSimulator(gui=True, clean_gui=True)
-    executor = ActionExecutor(sim, hooks=ExecutorHooks(**make_audio_hooks(speak=has_key)))
+    mixer = AudioMixer(sample_rate=OUTPUT_SAMPLE_RATE)
+    mixer.start()
+    # on_speak (the standalone "speak" Action, unrelated to live conversation)
+    # still uses the older tts.py request/response call; on_play_sound/
+    # on_music_on/on_music_off are overridden with the mixer's versions so
+    # SFX/music/(live speech, fed directly -- see fsm.py) all share one
+    # output stream instead of competing sd.play() calls.
+    hooks_dict = make_audio_hooks(speak=bool(api_key))
+    hooks_dict.update(mixer.make_hooks())
+    executor = ActionExecutor(sim, hooks=ExecutorHooks(**hooks_dict))
     watcher = EngagementWatcher()
-    speech = SpeechCapture(on_debug=print)
+
+    live_client = None
+    mic_streamer = None
+    if api_key:
+        live_client = GeminiLiveClient(LIVE_MODEL, api_key, on_debug=print)
+        mic_streamer = LiveMicStreamer(live_client, on_debug=print)
 
     print("Starting camera and microphone...")
     watcher.start()
-    speech.start()
+    if mic_streamer is not None:
+        mic_streamer.start()
+        print("Connecting to Gemini Live...")
+        if live_client.wait_until_connected(timeout_s=15.0):
+            print("Connected.")
+        else:
+            print("Still connecting in the background (will keep retrying)...")
     print("Watching. Look at your webcam to engage the lamp; look away to disengage.")
     print("While engaged, speak -- it only listens while it's paying attention to you.")
 
-    orchestrator = CharacterOrchestrator(executor, watcher, speech=speech, on_debug=print)
+    memory = SceneMemory()
+    orchestrator = CharacterOrchestrator(
+        executor, watcher, live_client=live_client, audio_mixer=mixer, memory=memory, on_debug=print
+    )
     try:
         orchestrator.run_forever(poll_hz=10.0)
     finally:
         watcher.stop()
-        speech.stop()
+        if mic_streamer is not None:
+            mic_streamer.stop()
+        if live_client is not None:
+            live_client.close()
+        mixer.close()
         sim.close()
 
 

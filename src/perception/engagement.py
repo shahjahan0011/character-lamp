@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass
 
 import cv2
+import numpy as np
 
 
 @dataclass
@@ -71,6 +72,13 @@ class EngagementWatcher:
         self._thread: threading.Thread | None = None
         self._running = False
 
+        # Most webcams only allow one consumer -- a second cv2.VideoCapture
+        # on the same device typically just fails to open. Scene-memory
+        # vision (a separate feature) reuses this same camera handle's
+        # frames via get_latest_frame() rather than opening its own.
+        self._frame_lock = threading.Lock()
+        self._latest_frame: np.ndarray | None = None
+
     def start(self) -> None:
         self._capture = cv2.VideoCapture(self._camera_index)
         if not self._capture.isOpened():
@@ -90,6 +98,12 @@ class EngagementWatcher:
         with self._lock:
             return EngagementState(**vars(self._state))
 
+    def get_latest_frame(self) -> np.ndarray | None:
+        """Most recent full-resolution BGR frame (a copy), or None before
+        the first frame arrives. Same camera handle as face detection."""
+        with self._frame_lock:
+            return None if self._latest_frame is None else self._latest_frame.copy()
+
     def _run(self) -> None:
         consecutive_face = 0
         consecutive_absent = 0
@@ -101,6 +115,8 @@ class EngagementWatcher:
             if not ok:
                 time.sleep(0.05)
                 continue
+            with self._frame_lock:
+                self._latest_frame = frame
 
             frame_h, frame_w = frame.shape[:2]
             scale = self._detect_width / frame_w

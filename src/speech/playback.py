@@ -74,16 +74,24 @@ def play_once(path: str, volume: float = 1.0, blocking: bool = False) -> None:
         sd.wait()
 
 
-def play_bytes(wav_bytes: bytes, volume: float = 1.0, blocking: bool = True) -> None:
+def play_bytes(wav_bytes: bytes, volume: float = 1.0, blocking: bool = True) -> float:
     """Plays in-memory WAV bytes (e.g. a TTS reply) -- default blocking=True
     since "speak" is meant to occupy the character for as long as it's
-    talking, same as a gesture occupies it for as long as it's moving."""
+    talking, same as a gesture occupies it for as long as it's moving.
+
+    Returns the clip's duration in seconds (known before playback starts,
+    from the decoded sample count) so a non-blocking caller can mute the
+    microphone for exactly that long -- without an acoustic-echo-cancelling
+    headset, the laptop mic can otherwise pick up the lamp's own voice
+    coming out of the speaker and try to treat it as a new utterance."""
     import io
 
     data, samplerate = sf.read(io.BytesIO(wav_bytes), dtype="float32")
+    duration_s = len(data) / samplerate
     sd.play(data * volume, samplerate)
     if blocking:
         sd.wait()
+    return duration_s
 
 
 SFX_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "assets", "sfx")
@@ -123,9 +131,4 @@ def make_audio_hooks(music_volume: float = 0.5, speak: bool = True) -> dict:
 
         hooks["on_speak"] = on_speak
 
-    # Non-blocking: the whole point of on_speak_audio is playing a reply
-    # that's already been synthesized, specifically so CharacterOrchestrator
-    # can start it and then run a gesture Action *while it plays*, rather
-    # than gesture-then-speak happening one after the other.
-    hooks["on_speak_audio"] = lambda wav_bytes: play_bytes(wav_bytes, blocking=False)
     return hooks

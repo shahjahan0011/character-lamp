@@ -17,6 +17,16 @@ recognised" the first time this was wired up against a different model
 switching models for the free-tier quota reasons in gemini_client.py. The
 response carries its own sample_rate/channels per chunk, so those are
 trusted rather than hardcoding 24kHz mono.
+
+TTS_MODEL is gemini-3.8-flash-lite-tts, not the older gemini-2.5-flash-
+preview-tts -- confirmed live the older model is capped at 10 requests/
+day free tier (see gemini_client.py). An earlier version of this file
+added a system_instruction to work around that older model occasionally
+trying to respond conversationally to short text instead of vocalizing
+it; gemini-3.8-flash-lite-tts rejects system_instruction outright
+("Developer instruction is not enabled for this model") and, tested live
+against the exact same previously-failing text, didn't reproduce the
+original problem anyway.
 """
 
 from __future__ import annotations
@@ -27,7 +37,7 @@ import io
 import numpy as np
 import soundfile as sf
 
-from .gemini_client import TTS_MODEL, get_client
+from .gemini_client import TTS_MODEL, get_client, raise_if_error_event
 
 DEFAULT_VOICE = "Kore"
 
@@ -52,6 +62,7 @@ def synthesize(text: str, voice: str = DEFAULT_VOICE, timeout_s: float = 45.0) -
     sample_rate = 24000
     channels = 1
     for event in stream:
+        raise_if_error_event(event)
         delta = getattr(event, "delta", None)
         if delta is None or getattr(delta, "type", None) != "audio":
             continue

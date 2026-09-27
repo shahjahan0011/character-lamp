@@ -44,7 +44,7 @@ import re
 from dataclasses import dataclass
 from typing import Literal
 
-from .gemini_client import TEXT_MODEL, get_client
+from .gemini_client import TEXT_MODEL, collect_text_stream, get_client
 
 Gesture = Literal["nod", "shake_head", "excited", "curious", "none"]
 _VALID_GESTURES = {"nod", "shake_head", "excited", "curious", "none"}
@@ -70,12 +70,13 @@ PERSONA = (
     "REPLY: <your spoken reply>"
 )
 
-AUDIO_PERSONA = (
+AUDIO_PERSONA_TEMPLATE = (
     "You are the voice of a small friendly desk lamp character (like "
     "Pixar's Luxo Jr., but able to talk). Someone just spoke to you in "
     "this audio clip. Listen to what they said and reply warmly and "
     "conversationally in 1-2 short sentences -- this will be spoken "
     "aloud, not read, so keep it natural to say out loud.\n\n"
+    "{memory_context}\n\n"
     + _REACTION_RULES
     + "Respond in EXACTLY this three-line format, nothing else, no markdown:\n"
     "TRANSCRIPT: <verbatim transcript of what they said, or an empty "
@@ -100,6 +101,13 @@ class AudioDialogueResponse:
     transcript: str
     reply: str
     gesture: Gesture
+    # The model's full, unparsed response text -- kept so a caller can log
+    # it when transcript comes back empty. Distinguishes "the model
+    # genuinely heard no speech in the clip" from "the model said
+    # something but didn't follow the exact TRANSCRIPT:/GESTURE:/REPLY:
+    # format we regex-parse, so we silently threw its answer away" --
+    # those look identical from a transcript-is-empty check alone.
+    raw: str
 
 
 def _extract_gesture(raw: str) -> Gesture:
@@ -122,17 +130,8 @@ def _parse_audio(raw: str) -> AudioDialogueResponse:
     transcript_match = _TRANSCRIPT_RE.search(raw)
     transcript = transcript_match.group(1).strip() if transcript_match else ""
     return AudioDialogueResponse(
-        transcript=transcript, reply=_extract_reply(raw), gesture=_extract_gesture(raw)
+        transcript=transcript, reply=_extract_reply(raw), gesture=_extract_gesture(raw), raw=raw
     )
-
-
-def _collect_text_stream(stream) -> str:
-    chunks: list[str] = []
-    for event in stream:
-        delta = getattr(event, "delta", None)
-        if delta is not None and getattr(delta, "type", None) == "text":
-            chunks.append(delta.text or "")
-    return "".join(chunks)
 
 
 def respond(transcript: str, timeout_s: float = 30.0) -> DialogueResponse:
@@ -143,15 +142,20 @@ def respond(transcript: str, timeout_s: float = 30.0) -> DialogueResponse:
         stream=True,
         timeout=timeout_s,
     )
-    return _parse(_collect_text_stream(stream))
+    return _parse(collect_text_stream(stream))
 
 
-def respond_to_audio(wav_bytes: bytes, timeout_s: float = 45.0) -> AudioDialogueResponse:
+def respond_to_audio(
+    wav_bytes: bytes, memory_context: str = "", timeout_s: float = 45.0
+) -> AudioDialogueResponse:
     client = get_client()
+    persona = AUDIO_PERSONA_TEMPLATE.format(
+        memory_context=memory_context or "You have not noticed any objects nearby yet."
+    )
     stream = client.interactions.create(
         model=TEXT_MODEL,
         input=[
-            {"type": "text", "text": AUDIO_PERSONA},
+            {"type": "text", "text": persona},
             {
                 "type": "audio",
                 "data": base64.b64encode(wav_bytes).decode("utf-8"),
@@ -161,4 +165,4 @@ def respond_to_audio(wav_bytes: bytes, timeout_s: float = 45.0) -> AudioDialogue
         stream=True,
         timeout=timeout_s,
     )
-    return _parse_audio(_collect_text_stream(stream))
+    return _parse_audio(collect_text_stream(stream))

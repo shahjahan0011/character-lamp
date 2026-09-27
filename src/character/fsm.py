@@ -1,21 +1,33 @@
 """Ties perception signals to body actions.
 
 Handles engagement (demo moments 1 and 2: notice someone, acknowledge them,
-dim back down when they leave) and spoken interaction (demo moment 3: only
-listens while engaged, understands, replies). Memory/goal states get added
-here later without changing how this part works -- it just reads whatever
-EngagementWatcher/SpeechCapture/DialogueWorker report and reacts.
+dim back down when they leave), spoken interaction (demo moment 3: a
+persistent Gemini Live session, not a per-utterance request/response
+chain -- see live_client.py for why), and scene memory (demo moment 4:
+describe whatever's in view once per engagement, so a later spoken
+question can be answered from it). Goal states get added here later
+without changing how this part works -- it just reads whatever
+EngagementWatcher/GeminiLiveClient/SceneObserver report and reacts.
 
-Deliberately not calling the LLM for the engagement *reaction* (see design
-discussion): it needs to feel instantaneous, and a network round-trip would
-undercut that, so the acknowledgment is a fixed, hardcoded Action sequence.
-The spoken reply, by contrast, has to go through the LLM -- there's no
-faking "understood what you said and answered it". That round trip is slow
-(measured live: 30-60+ seconds combined), which is exactly why it runs on
-DialogueWorker's own background thread rather than inline here -- an
-earlier version blocked tick() directly on those calls, which froze
-engagement detection (confirmed live: disengage stopped working) for the
-entire wait.
+Deliberately not calling the LLM for the engagement *reaction*: it needs to
+feel instantaneous, and a network round-trip would undercut that, so the
+acknowledgment is a fixed, hardcoded Action sequence. The spoken
+conversation, by contrast, has to go through the model -- there's no
+faking "understood what you said and answered it".
+
+This module previously drove a per-utterance pipeline (record a full
+utterance -> one understand+reply call -> one separate TTS call) via
+DialogueWorker's own background thread. That's gone: it measured 30-90+
+seconds round trip, hit a hard 10-requests/day free-tier TTS quota wall,
+and needed elaborate mitigation (retries, a timer-based mic-mute guess) for
+a problem a persistent Live session doesn't have in the first place. Now
+GeminiLiveClient owns one always-open bidirectional session (connected
+once at startup -- reconnecting per-turn is what caused the occasional
+10+ second cold-start latency observed live), CharacterOrchestrator polls
+its event queue every tick() the same way it already polled
+EngagementWatcher/SceneObserver, and mic gating is a live, per-tick
+computed boolean (engaged, no turn in flight, nothing currently audible)
+rather than a guessed mute duration.
 """
 
 from __future__ import annotations
@@ -25,10 +37,12 @@ import time
 from typing import Callable, Optional
 
 from src.body.executor import ActionExecutor
-from src.character.dialogue_worker import DialogueWorker
+from src.character.memory import SceneMemory
+from src.character.scene_observer import SceneObserver
 from src.perception.engagement import EngagementWatcher
 from src.protocol.models import Action
-from src.speech.capture import SpeechCapture
+from src.speech.audio_mixer import AudioMixer
+from src.speech.live_client import GESTURE_NAMES, GeminiLiveClient, LiveEvent
 
 MAX_PAN_RAD = 0.7  # radians; matches base_yaw_joint's usable range for a look
 
@@ -37,13 +51,30 @@ NOTICE_FLASH_COUNT = 2
 NOTICE_FLASH_INTERVAL_S = 0.12
 IDLE_BRIGHTNESS = 0.2
 ENGAGED_BRIGHTNESS = 1.0
-# Free-tier Gemini audio calls are genuinely slow (measured live: 30-60+
-# seconds combined) -- a cool, dim, distinct color, a repeated gentle
-# "pondering" gesture, and a soft hum right as it starts, so the wait
-# reads as active thinking, not frozen/broken.
+# A brief warm/golden glow the instant local loudness detection notices
+# someone start talking -- well before the utterance is actually committed
+# (~600ms after they stop) -- so the character visibly reacts to being
+# spoken to immediately, not just once it's done "thinking" about a reply.
+LISTENING_COLOR = [1.0, 0.85, 0.5]
+# A cool, dim, distinct color, a repeated gentle "pondering" gesture, and a
+# soft hum right as a turn starts, so even the (now much shorter) wait for
+# first audio reads as active thinking rather than a frozen character.
 THINKING_COLOR = [0.55, 0.7, 1.0]
 THINKING_BRIGHTNESS = 0.45
 THINK_PULSE_INTERVAL_S = 3.5
+# A turn that neither produces audio nor completes within this long is
+# almost certainly stuck (dropped connection, model error) -- release the
+# mic gate and surface it rather than leaving the character stuck
+# "thinking" and unable to hear anything new indefinitely.
+TURN_TIMEOUT_S = 20.0
+
+# How often to re-look at the surroundings while engaged, not just once at
+# the moment of engagement -- so the lamp can notice something changed
+# (a new object appeared/moved) instead of only ever describing whatever
+# was in view the instant someone first looked at it. Long enough to not
+# burn through the vision-call quota needlessly; short enough that a
+# demo showing "it notices things changed" doesn't require a long wait.
+REOBSERVE_INTERVAL_S = 15.0
 
 # While nobody's engaged, the lamp wanders on its own every so often --
 # otherwise it just sits frozen, which reads as "off" rather than "alive but
@@ -58,24 +89,37 @@ class CharacterOrchestrator:
         self,
         executor: ActionExecutor,
         watcher: EngagementWatcher,
-        speech: Optional[SpeechCapture] = None,
-        dialogue_worker: Optional[DialogueWorker] = None,
+        live_client: Optional[GeminiLiveClient] = None,
+        audio_mixer: Optional[AudioMixer] = None,
+        observer: Optional[SceneObserver] = None,
+        memory: Optional[SceneMemory] = None,
         on_debug: Optional[Callable[[str], None]] = None,
     ):
         self.executor = executor
         self.watcher = watcher
-        self.speech = speech
+        self.live_client = live_client
+        self.audio_mixer = audio_mixer
         # Optional hook for tests/scripts to print what's happening -- the
         # executor swallows action exceptions into telemetry by design (one
         # bad action shouldn't kill the demo), which otherwise means a
         # failure looks identical to "nothing happened". This surfaces it.
         self._on_debug = on_debug or (lambda msg: None)
-        self.dialogue_worker = dialogue_worker or (
-            DialogueWorker(on_debug=self._on_debug) if speech is not None else None
+        # NOT `memory or SceneMemory()` -- SceneMemory defines __len__, so an
+        # empty-but-real instance passed in (the normal case: nothing's been
+        # observed yet) is falsy and `or` would silently swap in a different
+        # object than the caller shared with us.
+        self.memory = memory if memory is not None else SceneMemory()
+        self.observer = observer if observer is not None else SceneObserver(
+            memory=self.memory, on_debug=self._on_debug
         )
         self._last_engaged = False
         self._next_idle_wander_at = self._schedule_next_idle_wander()
         self._next_think_pulse_at = 0.0
+        self._turn_in_flight = False
+        self._turn_deadline = 0.0
+        self._awaiting_first_audio = False
+        self._next_reobserve_at = 0.0
+        self._last_nudged_labels: frozenset[str] = frozenset()
         # Starts disengaged, so the idle music starts playing immediately.
         self.executor.run(Action(kind="music_on", params={}))
 
@@ -108,93 +152,177 @@ class CharacterOrchestrator:
             self._on_debug("idle wander")
             self.executor.run(Action(kind="idle_sway", params={}))
             self._next_idle_wander_at = self._schedule_next_idle_wander()
-        elif state.engaged and self.speech is not None:
-            self._check_speech()
         self._last_engaged = state.engaged
-        # Checked every tick regardless of the branch above -- a reply can
-        # become ready at any moment, independent of whatever else is
-        # happening (including a disengage that happened while it was
-        # still in flight; see _check_dialogue_reply).
-        self._check_dialogue_reply(state.engaged)
-        self._check_thinking_pulse()
+        # Checked every tick regardless of the branch above -- Live events
+        # and observation results can arrive at any moment, independent of
+        # whatever else is happening.
+        if self.live_client is not None:
+            self._drain_live_events(state.engaged)
+            self._check_turn_timeout(state.engaged)
+            self._check_thinking_pulse()
+            self._update_mic_gate(state.engaged)
+        self._check_reobserve(state.engaged)
+        self._check_new_observation()
         self._report_failures()
 
-    def _check_speech(self) -> None:
-        if self.dialogue_worker is None:
-            return
-        utterance = self.speech.get_pending_utterance()
-        if utterance is None:
-            return
-        if self.dialogue_worker.submit(utterance):
-            self.executor.run(
-                Action(
-                    kind="set_light",
-                    params={"on": True, "color": THINKING_COLOR, "brightness": THINKING_BRIGHTNESS},
-                )
+    # -- Gemini Live event handling -------------------------------------------
+
+    def _drain_live_events(self, currently_engaged: bool) -> None:
+        for event in self.live_client.poll_events():
+            if event.kind == "connected":
+                self._on_debug("live: connected")
+            elif event.kind == "speech_started":
+                if currently_engaged and not self._turn_in_flight:
+                    self.executor.run(
+                        Action(
+                            kind="set_light",
+                            params={"on": True, "color": LISTENING_COLOR, "brightness": ENGAGED_BRIGHTNESS},
+                        )
+                    )
+            elif event.kind == "speech_committed":
+                self._on_turn_started()
+            elif event.kind == "audio_chunk":
+                self._on_audio_chunk(event.audio, currently_engaged)
+            elif event.kind == "tool_call":
+                self._on_tool_call(event)
+            elif event.kind == "turn_complete":
+                self._on_turn_complete(currently_engaged)
+            elif event.kind == "interrupted":
+                self.audio_mixer.interrupt_speech()
+                self._on_debug("live: playback interrupted (barge-in)")
+            elif event.kind == "error":
+                self._on_debug(f"live: error: {event.message}")
+
+    def _on_turn_started(self) -> None:
+        """Local silence detection just committed the user's utterance
+        (see live_capture.py) -- Gemini is now formulating a reply."""
+        self._turn_in_flight = True
+        self._turn_deadline = time.time() + TURN_TIMEOUT_S
+        self._awaiting_first_audio = True
+        self.executor.run(
+            Action(
+                kind="set_light",
+                params={"on": True, "color": THINKING_COLOR, "brightness": THINKING_BRIGHTNESS},
             )
-            self.executor.run(Action(kind="play_sound", params={"name": "thinking_hum.wav"}))
-            self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
+        )
+        self.executor.run(Action(kind="play_sound", params={"name": "thinking_hum.wav"}))
+        self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
+
+    def _on_audio_chunk(self, pcm_bytes: Optional[bytes], currently_engaged: bool) -> None:
+        if pcm_bytes is None or self.audio_mixer is None:
+            return
+        if not currently_engaged:
+            # Only listen or reply while engaged -- drop audio that arrives
+            # after the person's already looked away rather than playing a
+            # reply into an empty room. The model may keep generating
+            # server-side (there's no clean client-initiated cancel), but
+            # nothing plays or reacts on our end once disengaged.
+            return
+        if self._awaiting_first_audio:
+            self._awaiting_first_audio = False
+            self._turn_deadline = time.time() + TURN_TIMEOUT_S  # still speaking; extend the watchdog
+            self._restore_engaged_light()
+        self.audio_mixer.enqueue_speech_pcm16(pcm_bytes)
+
+    def _on_tool_call(self, event: LiveEvent) -> None:
+        name = (event.tool_args or {}).get("name")
+        valid = name in GESTURE_NAMES
+        if valid:
+            self.executor.run(Action(kind=name, params={}))
+        else:
+            self._on_debug(f"live: rejected invalid gesture tool call: {event.tool_args!r}")
+        # Gemini's turn stays open waiting for this -- an unknown/invalid
+        # name still gets an explicit response so the turn isn't left
+        # hanging, it just reports ok=False rather than performing anything.
+        self.live_client.submit_tool_result(
+            event.tool_call_id or "", event.tool_name or "perform_gesture", {"ok": valid}
+        )
+
+    def _on_turn_complete(self, currently_engaged: bool) -> None:
+        self._turn_in_flight = False
+        self._awaiting_first_audio = False
+        if currently_engaged:
+            self._restore_engaged_light()
+        # else: nothing to do -- _on_disengage() already set the idle
+        # light, and _on_audio_chunk() already suppressed any audio.
+
+    def _check_turn_timeout(self, currently_engaged: bool) -> None:
+        if not self._turn_in_flight or time.time() < self._turn_deadline:
+            return
+        self._on_debug("live: turn timed out (no audio/turn_complete) -- releasing mic gate")
+        self._turn_in_flight = False
+        self._awaiting_first_audio = False
+        if currently_engaged:
+            self.executor.run(Action(kind="shake_head", params={}))
+            self._restore_engaged_light()
 
     def _check_thinking_pulse(self) -> None:
-        """A slow, repeated 'pondering' dip while a reply is in flight --
-        otherwise the lamp just sits motionless for the entire 30-60+
-        second wait, which reads as frozen even with the light/sound cues."""
-        if self.dialogue_worker is None or not self.dialogue_worker.is_busy():
+        """A slow, repeated 'pondering' dip while a reply is in flight but
+        no audio has arrived yet -- keeps the character looking alive
+        during the (now much shorter, but nonzero) wait for first audio."""
+        if not self._turn_in_flight or not self._awaiting_first_audio:
             return
         if time.time() < self._next_think_pulse_at:
             return
         self.executor.run(Action(kind="think", params={}))
         self._next_think_pulse_at = time.time() + THINK_PULSE_INTERVAL_S
 
-    def _check_dialogue_reply(self, currently_engaged: bool) -> None:
-        if self.dialogue_worker is None:
-            return
-        if self.dialogue_worker.pop_failure():
-            # A real error (timeout, network failure, etc.) -- without
-            # this, a failed turn and "no speech was recognized" look
-            # identical from the outside: nothing happens. Visible cue
-            # only if still engaged; nobody to show it to otherwise.
-            if currently_engaged:
-                self._on_error()
-            return
-        reply = self.dialogue_worker.get_ready_reply()
-        if reply is None:
-            return
-        # Answer even if they've since looked away -- they asked a real
-        # question and still want it answered, even if they're not looking
-        # at the lamp right this second. Brighten briefly to deliver it,
-        # then dim back to idle afterward rather than staying lit as if
-        # still engaged.
-        if currently_engaged:
-            self._restore_engaged_light()
-        else:
-            self._on_debug(f'(delivering delayed reply after disengage: "{reply.reply}")')
-            self.executor.run(
-                Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": ENGAGED_BRIGHTNESS})
-            )
-        # Start the audio playing first (non-blocking -- see on_speak_audio),
-        # *then* run the gesture, so the gesture happens while it's actually
-        # talking instead of before or after.
-        self._speak_synthesized(reply.audio_bytes)
-        if reply.gesture != "none":
-            self.executor.run(Action(kind=reply.gesture, params={}))
+    def _update_mic_gate(self, currently_engaged: bool) -> None:
+        """Recomputed every tick from live state rather than a guessed mute
+        duration: open only while engaged, no turn in flight, and nothing
+        the mixer is currently playing (speech/SFX/music) could be picked
+        back up by the mic."""
+        output_pending = self.audio_mixer.output_pending if self.audio_mixer is not None else False
+        should_be_open = currently_engaged and not self._turn_in_flight and not output_pending
+        self.live_client.set_mic_gate(should_be_open)
+
+    # -- scene memory ----------------------------------------------------------
+
+    def _check_reobserve(self, currently_engaged: bool) -> None:
+        """Re-scans the surroundings periodically while engaged, not just
+        once at the moment of engagement, so the lamp can notice something
+        changed rather than only ever describing whatever was in view the
+        instant someone first looked at it."""
         if not currently_engaged:
-            self.executor.run(
-                Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": IDLE_BRIGHTNESS})
-            )
+            return
+        if time.time() < self._next_reobserve_at:
+            return
+        self._observe_scene()
+        self._next_reobserve_at = time.time() + REOBSERVE_INTERVAL_S
 
-    def _on_error(self) -> None:
-        self.executor.run(Action(kind="shake_head", params={}))
-        self._restore_engaged_light()
+    def _check_new_observation(self) -> None:
+        if self.observer.pop_failure():
+            # Silent by design: nobody's watching a "vision call failed"
+            # cue specifically, and the person can just ask again later --
+            # unlike a failed spoken turn, there's no waiting conversational
+            # turn to visibly resolve.
+            self._on_debug("scene observer: last observation failed")
+        result = self.observer.pop_new_observation()
+        if result is None:
+            return
+        objects, changed = result
+        current_labels = frozenset(o.label.lower() for o in objects)
+        # Only relay a nudge when the observed set actually differs from
+        # the last one we relayed -- re-observing an unchanged desk every
+        # ~15s shouldn't repeat the same "here's what you've seen" text
+        # into the live conversation's context each time.
+        if not changed and current_labels == self._last_nudged_labels:
+            return
+        self._last_nudged_labels = current_labels
+        if self.live_client is not None:
+            self.live_client.send_text_nudge(self.memory.as_context_text())
 
-    def _speak_synthesized(self, audio_bytes: bytes) -> None:
-        """Plays audio already synthesized by DialogueWorker -- deliberately
-        bypasses the speak Action/on_speak hook, which would call Gemini's
-        TTS *again* (another ~15s network call) for audio we already have."""
-        try:
-            self.executor.hooks.on_speak_audio(audio_bytes)
-        except Exception as exc:  # noqa: BLE001
-            self._on_debug(f"PLAYBACK FAILED: {exc}")
+    def _observe_scene(self) -> None:
+        """Kicks off one scene-description call (demo moment 4) -- grabs
+        whatever frame EngagementWatcher's camera thread most recently
+        captured rather than opening a second camera handle (most webcams
+        only allow one consumer). Fire-and-forget: the result lands in
+        self.memory whenever SceneObserver gets to it, and is relayed into
+        the live conversation via _check_new_observation() above."""
+        frame = self.watcher.get_latest_frame()
+        if frame is None:
+            return
+        self.observer.submit_observation(frame)
 
     def _restore_engaged_light(self) -> None:
         self.executor.run(
@@ -223,12 +351,12 @@ class CharacterOrchestrator:
         self.executor.run(
             Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": ENGAGED_BRIGHTNESS})
         )
-        if self.speech is not None:
-            self.speech.set_active(True)
+        # Mic gate opens on the next tick via _update_mic_gate (engaged,
+        # no turn in flight, nothing playing) -- no separate call needed.
+        self._observe_scene()
+        self._next_reobserve_at = time.time() + REOBSERVE_INTERVAL_S
 
     def _on_disengage(self) -> None:
-        if self.speech is not None:
-            self.speech.set_active(False)
         self.executor.run(
             Action(kind="set_light", params={"on": True, "color": WARM_WHITE, "brightness": IDLE_BRIGHTNESS})
         )
