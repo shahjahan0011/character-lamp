@@ -124,12 +124,10 @@ THINK_SPEED_SCALE = 0.4
 # Idle wandering (nobody engaged): gentle, curious-looking drift, not the
 # alert "attentive" lean used for look_at -- the two poses should read as
 # different moods. Ranges stay comfortably inside each joint's soft limits.
-IDLE_BASE_YAW_RANGE = (-1.2, 1.2)
-IDLE_SHOULDER_RANGE = (-0.3, 0.4)
-IDLE_ELBOW_RANGE = (-1.2, -0.3)
-IDLE_NECK_YAW_RANGE = (-0.6, 0.6)
-IDLE_HEAD_PITCH_RANGE = (-0.3, 0.2)
-IDLE_SPEED_SCALE = 0.35  # slower than a reflex -- idle drift, not a reaction
+IDLE_BASE_DELTA = 0.22
+IDLE_NECK_DELTA = 0.16
+IDLE_HEAD_DELTA = 0.10
+IDLE_SPEED_SCALE = 0.8
 
 
 @dataclass
@@ -213,12 +211,16 @@ class ActionExecutor:
         elif action.kind == "home":
             self._move_and_settle(HOME_POSE, speed_scale)
         elif action.kind == "idle_sway":
+            # Keep this deliberately small and quick. The executor is
+            # synchronous, so the previous full-body random pose blocked the
+            # main attention loop for 3-6 seconds and could delay engagement.
+            # A sub-second head/base glance still reads as alive without
+            # making the character unavailable while it moves.
+            current = self.sim.get_all_joint_angles()
             targets = {
-                "base_yaw_joint": random.uniform(*IDLE_BASE_YAW_RANGE),
-                "shoulder_pitch_joint": random.uniform(*IDLE_SHOULDER_RANGE),
-                "elbow_pitch_joint": random.uniform(*IDLE_ELBOW_RANGE),
-                "neck_yaw_joint": random.uniform(*IDLE_NECK_YAW_RANGE),
-                "head_pitch_joint": random.uniform(*IDLE_HEAD_PITCH_RANGE),
+                "base_yaw_joint": current["base_yaw_joint"] + random.uniform(-IDLE_BASE_DELTA, IDLE_BASE_DELTA),
+                "neck_yaw_joint": current["neck_yaw_joint"] + random.uniform(-IDLE_NECK_DELTA, IDLE_NECK_DELTA),
+                "head_pitch_joint": current["head_pitch_joint"] + random.uniform(-IDLE_HEAD_DELTA, IDLE_HEAD_DELTA),
             }
             self._move_and_settle(targets, speed_scale=IDLE_SPEED_SCALE)
         elif action.kind == "set_light":

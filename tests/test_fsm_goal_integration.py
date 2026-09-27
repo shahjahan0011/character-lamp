@@ -29,20 +29,29 @@ def make_orchestrator(engaged=True):
     mixer.output_pending = False
     mixer.pop_xrun_counts.return_value = (0, 0)
     memory = SceneMemory(persist_path=None)
+    observer = MagicMock()
+    observer.submit_observation.return_value = True
+    observer.pop_failure.return_value = False
+    observer.pop_new_observation.return_value = None
     orch = CharacterOrchestrator(
-        executor, watcher, live_client=live_client, audio_mixer=mixer, memory=memory, on_debug=print
+        executor, watcher, live_client=live_client, audio_mixer=mixer, observer=observer,
+        memory=memory, on_debug=print
     )
     return orch, executor, watcher, live_client, mixer, memory
 
 
-def test_tool_call_for_synchronous_tool_submits_result_immediately():
+def test_non_blocking_gesture_is_acknowledged_before_motion_runs():
     orch, executor, watcher, live_client, mixer, memory = make_orchestrator()
     orch.tick()  # ENGAGE
+    order = []
+    live_client.submit_tool_result.side_effect = lambda *args: order.append("tool_result")
+    executor.run.side_effect = lambda action, **kwargs: order.append(action.kind)
     live_client.poll_events.return_value = [
         LiveEvent(kind="tool_call", tool_name="perform_gesture", tool_args={"name": "nod"}, tool_call_id="c1")
     ]
     orch.tick()
-    live_client.submit_tool_result.assert_called_with("c1", "perform_gesture", {"ok": True})
+    live_client.submit_tool_result.assert_called_with("c1", "perform_gesture", {"ok": True, "status": "started"})
+    assert order.index("tool_result") < order.index("nod")
     gesture_calls = [c for c in executor.run.call_args_list if getattr(c.args[0], "kind", None) == "nod"]
     assert len(gesture_calls) >= 1
 

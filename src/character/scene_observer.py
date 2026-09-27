@@ -33,9 +33,7 @@ from src.character.memory import SceneMemory
 from src.character.observation_registry import ObservationRegistry
 from src.protocol.observation import Observation, ObservationPurpose
 from src.speech import vision
-from src.speech.gemini_client import GeminiStreamError, call_with_retry
-
-_RATE_LIMIT_CODES = frozenset({"rate_limit_exceeded", "quota_exceeded", "too_many_requests"})
+from src.speech.gemini_client import call_with_retry, is_rate_limit_error
 
 
 @dataclass
@@ -142,7 +140,7 @@ class SceneObserver:
                 self._process(job)
             except Exception as exc:  # noqa: BLE001 -- one bad observation shouldn't kill the worker
                 self._on_debug(f"scene observer error:\n{traceback.format_exc()}")
-                is_rate_limit = isinstance(exc, GeminiStreamError) and exc.code in _RATE_LIMIT_CODES
+                is_rate_limit = is_rate_limit_error(exc)
                 with self._result_lock:
                     self._failed = True
                     self._rate_limited = is_rate_limit

@@ -23,8 +23,8 @@ dependencies = [
     # One vendor for vision, tool-use/goal reasoning, native audio
     # conversation (Live), and TTS -- Gemini's free tier (Flash models)
     # needs no credit card and covers all of it. Upper-bounded: this
-    # project relies on interactions.create()'s response_format JSON-
-    # schema constraint, client.aio.live.connect(), and function-
+    # project relies on models.generate_content() structured output,
+    # client.aio.live.connect(), and function-
     # declaration `behavior: BLOCKING`, all confirmed against 2.25.0 --
     # an unannounced breaking change in a major version bump is a real
     # risk worth guarding against explicitly.

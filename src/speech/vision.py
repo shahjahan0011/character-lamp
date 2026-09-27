@@ -1,10 +1,8 @@
 """Scene understanding via Gemini vision -- demo moment 4 (scene memory)
 and the perception half of goal-directed action (demo moment 5).
 
-One frame per call. Uses response_format's JSON-schema constraint
-(confirmed live: interactions.create() supports
-response_format={"type": "text", "mime_type": "application/json",
-"schema": {...}}) rather than a free-text-plus-regex parser -- also
+One frame per call. Uses generate_content's JSON-schema constraint
+rather than a free-text-plus-regex parser -- also
 confirmed live, grounding normalized image_x/image_y this way against a
 test image with known object positions landed within ~1% of the computed
 true center, which a label/attribute-only parser had no way to produce at
@@ -19,18 +17,18 @@ never writes them to disk.
 
 from __future__ import annotations
 
-import base64
 import json
 import time
 import uuid
 
 import cv2
 import numpy as np
+from google.genai import types
 from pydantic import ValidationError
 
 from src.protocol.observation import DetectedObject, Observation, ObservationPurpose
 
-from .gemini_client import VISION_MODEL, collect_text_stream, get_client
+from .gemini_client import configured_vision_model, get_client
 
 DESCRIBE_PROMPT = (
     "Look at this image from a small desk lamp's webcam. Describe up to 6 "
@@ -79,21 +77,20 @@ def describe_scene(
         raise RuntimeError("Failed to JPEG-encode the frame")
 
     client = get_client()
-    stream = client.interactions.create(
-        model=VISION_MODEL,
-        input=[
-            {"type": "text", "text": DESCRIBE_PROMPT},
-            {
-                "type": "image",
-                "data": base64.b64encode(jpeg.tobytes()).decode("utf-8"),
-                "mime_type": "image/jpeg",
-            },
+    response = client.models.generate_content(
+        model=configured_vision_model(),
+        contents=[
+            DESCRIBE_PROMPT,
+            types.Part.from_bytes(data=jpeg.tobytes(), mime_type="image/jpeg"),
         ],
-        response_format={"type": "text", "mime_type": "application/json", "schema": _RESPONSE_SCHEMA},
-        stream=True,
-        timeout=timeout_s,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_json_schema=_RESPONSE_SCHEMA,
+            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
+            http_options=types.HttpOptions(timeout=int(timeout_s * 1000)),
+        ),
     )
-    raw = collect_text_stream(stream)
+    raw = response.text or ""
     objects = _parse_objects(raw)
     return Observation(
         observation_id=uuid.uuid4().hex,

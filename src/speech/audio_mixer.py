@@ -48,7 +48,7 @@ class AudioMixer:
     """Owns one sounddevice OutputStream and mixes speech/SFX/music in its
     callback. All public methods are safe to call from any thread."""
 
-    def __init__(self, sample_rate: int = 24000, channels: int = 1, prime_s: float = 0.2):
+    def __init__(self, sample_rate: int = 24000, channels: int = 1, prime_s: float = 0.12):
         self.sample_rate = sample_rate
         self.channels = channels
         self._speech: deque[np.ndarray] = deque(maxlen=200)
@@ -60,10 +60,8 @@ class AudioMixer:
         self._stream: sd.OutputStream | None = None
         # Confirmed live: playing speech chunks as soon as even one arrives
         # produces crackling/glitchy ("farting") audio -- chunks are
-        # delivered to enqueue_speech_pcm16() in bursts (fsm.py only drains
-        # the Live event queue once per ~100ms tick), while the output
-        # callback consumes them continuously in real time, so the queue
-        # can run dry between bursts. Buffering a small cushion before
+        # delivered to enqueue_speech_pcm16() with some network jitter while
+        # the output callback consumes them continuously. Buffering a small cushion before
         # starting playback (re-armed each time the queue fully drains, so
         # it applies at the start of every new reply) absorbs that jitter
         # at the cost of a small, fixed, one-time delay per turn -- well

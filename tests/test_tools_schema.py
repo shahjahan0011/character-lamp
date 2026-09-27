@@ -13,6 +13,7 @@ from src.protocol.tools import (
     RequestObservationArgs,
     SetLightToolArgs,
 )
+from src.speech.live_client import _tool_declarations
 
 
 def test_all_declared_tools_have_a_schema():
@@ -26,6 +27,12 @@ def test_all_declared_tools_have_a_schema():
         "finish_goal",
     }
     assert set(TOOL_ARG_MODELS.keys()) == expected
+
+
+def test_only_reaction_gesture_is_non_blocking():
+    behaviors = {item["name"]: item["behavior"] for item in _tool_declarations()}
+    assert behaviors["perform_gesture"] == "NON_BLOCKING"
+    assert all(behavior == "BLOCKING" for name, behavior in behaviors.items() if name != "perform_gesture")
 
 
 def test_request_observation_rejects_unknown_purpose():

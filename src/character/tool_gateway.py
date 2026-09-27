@@ -6,8 +6,8 @@ write, a goal-stage transition) -- nothing upstream of here (live_client's
 event plumbing, fsm.py's tick loop) knows what any tool actually does.
 
 Every call returns a structured {"ok": bool, ...} result rather than
-raising -- a Live turn is genuinely waiting on this (request_observation
-and friends are declared Behavior.BLOCKING; see live_client.py), so an
+raising -- most stateful Live tools are declared Behavior.BLOCKING (the
+purely expressive gesture is non-blocking; see live_client.py), so an
 unhandled exception here would hang that turn rather than just failing
 one call. request_observation is the one exception to "returns
 synchronously": it needs a real network vision call, which happens on

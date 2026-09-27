@@ -19,6 +19,8 @@ def test_parse_args_defaults():
     assert args.headless is False
     assert args.offline is False
     assert args.force_engaged is False
+    assert args.check_live is False
+    assert args.mic_threshold is None
     assert args.data_dir == "var"
     assert args.log_level == "INFO"
 
@@ -33,6 +35,12 @@ def test_parse_args_offline_and_headless():
 def test_mock_model_alias_sets_offline():
     args = run_character.parse_args(["--mock-model"])
     assert args.offline is True
+
+
+def test_parse_args_live_diagnostics():
+    args = run_character.parse_args(["--check-live", "--mic-threshold", "125"])
+    assert args.check_live is True
+    assert args.mic_threshold == 125
 
 
 def test_offline_demo_runs_end_to_end_headless(tmp_path):

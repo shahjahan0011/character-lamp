@@ -63,8 +63,8 @@ def make_thinking_hum() -> np.ndarray:
 
 
 def make_lounge_loop(duration_s: float = 16.0) -> np.ndarray:
-    """A slow, soft ambient pad loop -- ii-V-I-vi style chord bed with a
-    gentle filtered-noise "shaker" pulse, meant to sit quietly in the
+    """A slow, soft ambient pad loop -- ii-V-I-vi style chord bed, with no
+    noise/percussion layer, meant to sit quietly in the
     background while nobody's engaged. Loops seamlessly (matching phase at
     the loop boundary -- each chord is an integer number of beats)."""
     bpm = 70
@@ -93,25 +93,6 @@ def make_lounge_loop(duration_s: float = 16.0) -> np.ndarray:
         pad *= envelope
         start = int(SR * chord_dur * i)
         out[start : start + len(pad)] += pad
-
-    # A quiet, slow filtered-noise pulse on each beat -- reads as a soft
-    # brushed-shaker texture under the pads, common in lounge/lofi beds.
-    rng = np.random.default_rng(seed=7)
-    noise = rng.standard_normal(n_samples)
-    # Simple one-pole low-pass to take the harsh edge off the noise.
-    filtered = np.zeros_like(noise)
-    alpha = 0.05
-    prev = 0.0
-    for i in range(len(noise)):
-        prev = alpha * noise[i] + (1 - alpha) * prev
-        filtered[i] = prev
-    beat_samples = int(SR * beat)
-    pulse_env = np.zeros(n_samples)
-    for start in range(0, n_samples, beat_samples):
-        length = min(int(beat_samples * 0.15), n_samples - start)
-        decay = np.exp(-np.linspace(0, 8, length))
-        pulse_env[start : start + length] = decay
-    out += filtered * pulse_env * 0.05
 
     out = out / max(np.abs(out).max(), 1e-9) * 0.5
     return _fade(out, int(SR * 0.3))

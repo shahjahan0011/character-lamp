@@ -34,7 +34,7 @@ from google import genai
 # spare, and is Google's own currently-recommended model -- the older
 # gemini-2.5-flash-lite is already a 404 for new users ("no longer
 # available... use gemini-3.5-flash-lite").
-VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
+VISION_MODEL = "gemini-3.5-flash-lite"
 
 # NOT gemini-2.5-flash-preview-tts -- confirmed live via a real
 # rate_limit_exceeded error (only surfaced after fixing error-swallowing;
@@ -47,7 +47,17 @@ VISION_MODEL = os.environ.get("GEMINI_VISION_MODEL", "gemini-3.5-flash-lite")
 # error-swallowing fix made the real rate_limit_exceeded message visible.
 # gemini-3.8-flash-lite-tts tested clean (real audio deltas, no error
 # event) against the same account/key.
-TTS_MODEL = os.environ.get("GEMINI_TTS_MODEL", "gemini-3.8-flash-lite-tts")
+TTS_MODEL = "gemini-3.8-flash-lite-tts"
+
+
+def configured_vision_model() -> str:
+    """Resolve after the launcher's load_dotenv(), not at import time."""
+    return os.environ.get("GEMINI_VISION_MODEL", VISION_MODEL)
+
+
+def configured_tts_model() -> str:
+    """Resolve after the launcher's load_dotenv(), not at import time."""
+    return os.environ.get("GEMINI_TTS_MODEL", TTS_MODEL)
 
 _client: genai.Client | None = None
 
@@ -178,4 +188,15 @@ def call_with_retry(
 def _is_retryable(exc: Exception) -> bool:
     if isinstance(exc, GeminiStreamError):
         return exc.code in _RETRYABLE_ERROR_CODES
+    status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    if status in {429, 500, 502, 503, 504}:
+        return True
     return "timeout" in str(exc).lower() or "timeout" in type(exc).__name__.lower()
+
+
+def is_rate_limit_error(exc: Exception) -> bool:
+    """Recognize both legacy stream errors and normal SDK HTTP errors."""
+    if isinstance(exc, GeminiStreamError):
+        return exc.code in {"rate_limit_exceeded", "quota_exceeded", "too_many_requests"}
+    status = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+    return status == 429 or "quota" in str(exc).lower() or "rate limit" in str(exc).lower()

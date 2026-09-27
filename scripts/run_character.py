@@ -50,7 +50,7 @@ from src.perception.engagement import EngagementState, EngagementWatcher
 from src.protocol.observation import DetectedObject, Observation
 from src.speech.audio_mixer import AudioMixer
 from src.speech.error_speech import ErrorSpeech
-from src.speech.live_capture import LiveMicStreamer
+from src.speech.live_capture import MIN_SPEECH_RMS, LiveMicStreamer
 from src.speech.live_client import LIVE_MODEL, OUTPUT_SAMPLE_RATE, GeminiLiveClient
 from src.speech.playback import make_audio_hooks
 
@@ -71,6 +71,14 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--force-engaged", action="store_true",
         help="Diagnostic: use the real camera but always report engaged=True, skipping face-detection gating",
+    )
+    parser.add_argument(
+        "--check-live", action="store_true",
+        help="Check Gemini Live connection, tool round-trip, and audio generation without opening camera/mic/speaker",
+    )
+    parser.add_argument(
+        "--mic-threshold", type=float, default=None,
+        help=f"Speech RMS threshold (default: CHARACTER_LAMP_MIC_RMS_THRESHOLD or {MIN_SPEECH_RMS:g})",
     )
     parser.add_argument("--data-dir", type=str, default="var", help="Directory for persisted scene memory (default: var)")
     parser.add_argument(
@@ -289,8 +297,19 @@ def run_live(args: argparse.Namespace) -> None:
     mic_streamer = None
     error_speech = None
     if api_key:
-        live_client = GeminiLiveClient(LIVE_MODEL, api_key, on_audio_chunk=mixer.enqueue_speech_pcm16, on_debug=log.debug)
-        mic_streamer = LiveMicStreamer(live_client, on_debug=log.debug)
+        # Resolve this after load_dotenv().  The old code imported
+        # LIVE_MODEL before loading .env, which silently ignored a model
+        # override placed in that file.
+        live_model = os.environ.get("GEMINI_LIVE_MODEL", LIVE_MODEL)
+        mic_threshold = args.mic_threshold
+        if mic_threshold is None:
+            mic_threshold = float(os.environ.get("CHARACTER_LAMP_MIC_RMS_THRESHOLD", MIN_SPEECH_RMS))
+        log.info("Gemini Live model: %s", live_model)
+        log.info("Microphone speech threshold: RMS %.0f", mic_threshold)
+        live_client = GeminiLiveClient(
+            live_model, api_key, on_audio_chunk=mixer.enqueue_speech_pcm16, on_debug=log.debug
+        )
+        mic_streamer = LiveMicStreamer(live_client, speech_rms_threshold=mic_threshold, on_debug=log.debug)
         error_speech = ErrorSpeech(mixer, on_debug=log.debug)
         error_speech.preload()
 
@@ -329,12 +348,87 @@ def run_live(args: argparse.Namespace) -> None:
         sim.close()
 
 
+def run_live_check() -> None:
+    """Exercise the real Live API without touching local AV hardware.
+
+    A successful socket connection alone is not enough: Gemini frequently
+    calls a gesture before speaking, and a lost BLOCKING tool result looks
+    exactly like a silent model.  This check acknowledges that call and
+    requires both generated audio and a completed turn.
+    """
+    load_dotenv()
+    api_key = os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is missing; copy .env.example to .env and add it first")
+
+    model = os.environ.get("GEMINI_LIVE_MODEL", LIVE_MODEL)
+    audio_bytes = 0
+    request_started_at = 0.0
+    first_audio_s: float | None = None
+
+    def receive_audio(chunk: bytes) -> None:
+        nonlocal audio_bytes, first_audio_s
+        audio_bytes += len(chunk)
+        if first_audio_s is None and request_started_at:
+            first_audio_s = time.monotonic() - request_started_at
+
+    client = GeminiLiveClient(model, api_key, on_audio_chunk=receive_audio, on_debug=log.debug)
+    client.set_engaged(True)
+    try:
+        log.info("Checking Gemini Live model %s...", model)
+        if not client.wait_until_connected(timeout_s=20.0):
+            raise RuntimeError("Gemini Live did not connect within 20 seconds")
+        request_started_at = time.monotonic()
+        client.send_text_nudge("Connection check: reply briefly that the lamp is online.")
+        deadline = time.monotonic() + 25.0
+        completed = False
+        tool_calls = 0
+        while time.monotonic() < deadline and not completed:
+            for event in client.poll_events():
+                if event.kind == "error":
+                    raise RuntimeError(f"Gemini Live error: {event.message}")
+                if event.kind == "tool_call":
+                    tool_calls += 1
+                    # No body exists in this hardware-free check.  Returning
+                    # a result is still essential because all tools are
+                    # deliberately BLOCKING.
+                    client.submit_tool_result(
+                        event.tool_call_id or "", event.tool_name or "", {"ok": True, "self_test": True}
+                    )
+                elif event.kind == "turn_complete" and audio_bytes > 0:
+                    # A NON_BLOCKING function call can close its scheduling
+                    # turn before the WHEN_IDLE tool response triggers the
+                    # spoken continuation. Only the post-audio completion is
+                    # the end of this check.
+                    completed = True
+            time.sleep(0.02)
+        if not completed or audio_bytes == 0:
+            raise RuntimeError(
+                f"Live check timed out (turn_complete={completed}, audio_bytes={audio_bytes}, tool_calls={tool_calls})"
+            )
+        log.info(
+            "Live check passed: connected, answered %d tool call(s), first audio %.2fs, received %d audio bytes.",
+            tool_calls,
+            first_audio_s or 0.0,
+            audio_bytes,
+        )
+    finally:
+        client.close(timeout_s=3.0)
+
+
 def main(argv: list[str] | None = None) -> None:
     args = parse_args(argv)
-    logging.basicConfig(level=getattr(logging, args.log_level), format="%(message)s")
+    # Keep third-party libraries at WARNING even when our own diagnostics
+    # are set to DEBUG.  In particular, the WebSocket stack's wire logger
+    # includes HTTP request headers, which can contain the Gemini API key.
+    logging.basicConfig(level=logging.WARNING, format="%(message)s")
+    log.setLevel(getattr(logging, args.log_level))
 
     if args.list_audio_devices:
         list_audio_devices()
+        return
+    if args.check_live:
+        run_live_check()
         return
     if args.offline:
         run_offline_demo(headless=args.headless, data_dir=Path(args.data_dir))

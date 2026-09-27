@@ -49,9 +49,8 @@ INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000  # confirmed live: Live API's audio/pcm output mime rate
 
 # Configurable via GEMINI_LIVE_MODEL. Measured live before picking this
-# default: gemini-3.8-live landed ~1.2s to first audio and correctly
-# waited on a Behavior.BLOCKING tool call before speaking (both confirmed
-# against the real API). gemini-2.5-flash-native-audio-latest (this
+# default: gemini-3.8-live landed ~1.2s to first audio in an early probe.
+# gemini-2.5-flash-native-audio-latest (this
 # project's earlier default) also still works -- measured ~1.7-2.2s to
 # first audio on a warm connection -- and remains available via
 # GEMINI_LIVE_MODEL as a tested, documented fallback if gemini-3.8-live
@@ -143,7 +142,7 @@ TOOL_DESCRIPTIONS = {
         "precise 3-D localization."
     ),
     "set_light": "Adjust the lamp's own light brightness/mode.",
-    "perform_gesture": "Perform one bounded physical reaction gesture on the lamp's body.",
+    "perform_gesture": "Start one bounded physical reaction gesture on the lamp's body.",
     "finish_goal": (
         "Report a goal's outcome. Only succeeds if a fresh goal_planning "
         "observation, at least one action, and a fresh goal_verification "
@@ -161,16 +160,12 @@ def _tool_declarations() -> list[dict]:
                 "name": name,
                 "description": TOOL_DESCRIPTIONS[name],
                 "parameters": parameters,
-                # Gemini 3.8 Live's function calling is async by default;
-                # every one of these tools has a local invariant that must
-                # be satisfied *before* the model continues (a goal action
-                # ordered before its observation, or a hung turn waiting on
-                # a call we never actually answer) -- BLOCKING makes the
-                # model wait for the real result rather than guessing
-                # ahead. Confirmed live against gemini-3.8-live: the model
-                # correctly waited for a BLOCKING tool's response before
-                # producing any audio.
-                "behavior": "BLOCKING",
+                # A reaction gesture is allowed to overlap the spoken reply;
+                # making Gemini wait for a 1-3s physical animation added that
+                # entire duration to first audio. Observation/memory/goal
+                # tools remain BLOCKING because their results affect what the
+                # model is allowed to claim or do next.
+                "behavior": "NON_BLOCKING" if name == "perform_gesture" else "BLOCKING",
             }
         )
     return declarations
@@ -233,6 +228,8 @@ class GeminiLiveClient:
         self._mic_gate_open = threading.Event()
         self._connected = threading.Event()
         self._stop = threading.Event()
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._active_session = None
         # Separate from mic gating (which also closes mid-turn/mid-
         # playback while still engaged) -- this specifically answers "is
         # anyone currently engaged at all", so a reply that finishes
@@ -277,6 +274,7 @@ class GeminiLiveClient:
             self._engaged.clear()
 
     def set_mic_gate(self, open_: bool) -> None:
+        was_open = self._mic_gate_open.is_set()
         if open_:
             self._mic_gate_open.set()
         else:
@@ -291,6 +289,8 @@ class GeminiLiveClient:
                     self._mic_queue.get_nowait()
                 except queue.Empty:
                     break
+        if open_ != was_open:
+            self._on_debug(f"live mic gate: {'open' if open_ else 'closed'}")
 
     def feed_mic_audio(self, pcm16_bytes: bytes) -> None:
         """Called from the mic capture thread (see live_capture.py) --
@@ -313,7 +313,7 @@ class GeminiLiveClient:
         instant local loudness detection notices someone started talking --
         lets the orchestrator give immediate "I hear you" feedback well
         before the utterance is actually committed (which waits for local
-        silence, ~600ms after they stop -- see live_capture.py's
+        silence, ~400ms after they stop -- see live_capture.py's
         SILENCE_CHUNKS_TO_END)."""
         self._events.put(LiveEvent(kind="speech_started"))
 
@@ -358,18 +358,29 @@ class GeminiLiveClient:
         daemon (see __init__), so the process can still exit cleanly even
         if this specific join times out."""
         self._stop.set()
+        loop = self._loop
+        session = self._active_session
+        if loop is not None and session is not None and loop.is_running():
+            # Closing the websocket wakes session.receive() immediately;
+            # otherwise the daemon can survive past loop teardown and emit
+            # "Task was destroyed but it is pending" on a clean Ctrl+C.
+            with contextlib.suppress(Exception):
+                future = asyncio.run_coroutine_threadsafe(session.close(), loop)
+                future.result(timeout=max(0.1, timeout_s / 2))
         self._thread.join(timeout=timeout_s)
 
     # -- background thread: owns its own asyncio event loop ------------------
 
     def _thread_main(self) -> None:
         loop = asyncio.new_event_loop()
+        self._loop = loop
         asyncio.set_event_loop(loop)
         try:
             loop.run_until_complete(self._main())
         except Exception:  # noqa: BLE001 -- last-resort: this thread must not die silently
             self._on_debug(f"live client fatal error:\n{traceback.format_exc()}")
         finally:
+            self._loop = None
             loop.close()
 
     async def _main(self) -> None:
@@ -389,53 +400,59 @@ class GeminiLiveClient:
         first_connect = True
         active_model = self._model
         fallback_attempted = False
-        while not self._stop.is_set():
-            try:
-                async with client.aio.live.connect(model=active_model, config=config) as session:
-                    self._connected.set()
-                    self._events.put(LiveEvent(kind="connected"))
-                    self._on_debug("live session connected")
-                    if not first_connect:
-                        # A reconnect otherwise starts with zero memory of
-                        # the conversation -- restore what we can from our
-                        # own bounded transcript + the last scene-memory
-                        # nudge (see _build_reconnect_recap), rather than
-                        # the model acting like it's meeting the person for
-                        # the first time again mid-conversation.
-                        recap = self._build_reconnect_recap()
-                        if recap:
-                            self._text_nudges.put(recap)
-                            self._on_debug("live: queued reconnect recap to restore context")
-                    first_connect = False
-                    attempt = 0
-                    await asyncio.gather(
-                        self._send_loop(session, types),
-                        self._receive_loop(session),
-                    )
-            except Exception as exc:  # noqa: BLE001 -- the connection itself died; must reconnect
-                self._connected.clear()
-                self._events.put(LiveEvent(kind="error", message=str(exc)))
-                self._on_debug(f"live session error ({type(exc).__name__}), reconnecting: {exc}")
-                if self._stop.is_set():
-                    return
-                if (
-                    not fallback_attempted
-                    and attempt >= 1
-                    and active_model != LIVE_MODEL_FALLBACK
-                ):
-                    # The configured/default model failed to connect twice
-                    # in a row -- fall back to the other model confirmed
-                    # live to work with this pipeline (see LIVE_MODEL's
-                    # docstring) rather than retrying the same broken
-                    # model indefinitely.
-                    self._on_debug(
-                        f"live: '{active_model}' failed repeatedly, falling back to "
-                        f"'{LIVE_MODEL_FALLBACK}'"
-                    )
-                    active_model = LIVE_MODEL_FALLBACK
-                    fallback_attempted = True
-                await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
-                attempt += 1
+        try:
+            while not self._stop.is_set():
+                try:
+                    async with client.aio.live.connect(model=active_model, config=config) as session:
+                        self._active_session = session
+                        self._connected.set()
+                        self._events.put(LiveEvent(kind="connected"))
+                        self._on_debug("live session connected")
+                        if not first_connect:
+                            # A reconnect otherwise starts with zero memory of
+                            # the conversation -- restore what we can from our
+                            # own bounded transcript + the last scene-memory
+                            # nudge (see _build_reconnect_recap), rather than
+                            # the model acting like it's meeting the person for
+                            # the first time again mid-conversation.
+                            recap = self._build_reconnect_recap()
+                            if recap:
+                                self._text_nudges.put(recap)
+                                self._on_debug("live: queued reconnect recap to restore context")
+                        first_connect = False
+                        attempt = 0
+                        await asyncio.gather(
+                            self._send_loop(session, types),
+                            self._receive_loop(session),
+                        )
+                except Exception as exc:  # noqa: BLE001 -- the connection itself died; must reconnect
+                    self._connected.clear()
+                    if self._stop.is_set():
+                        break
+                    self._events.put(LiveEvent(kind="error", message=str(exc)))
+                    self._on_debug(f"live session error ({type(exc).__name__}), reconnecting: {exc}")
+                    if (
+                        not fallback_attempted
+                        and attempt >= 1
+                        and active_model != LIVE_MODEL_FALLBACK
+                    ):
+                        # The configured/default model failed to connect twice
+                        # in a row -- fall back to the other model confirmed
+                        # live to work with this pipeline (see LIVE_MODEL's
+                        # docstring) rather than retrying the same broken
+                        # model indefinitely.
+                        self._on_debug(
+                            f"live: '{active_model}' failed repeatedly, falling back to "
+                            f"'{LIVE_MODEL_FALLBACK}'"
+                        )
+                        active_model = LIVE_MODEL_FALLBACK
+                        fallback_attempted = True
+                    await asyncio.sleep(delays[min(attempt, len(delays) - 1)])
+                    attempt += 1
+                finally:
+                    self._active_session = None
+        finally:
+            await client.aio.aclose()
 
     def _build_reconnect_recap(self) -> str:
         parts = []

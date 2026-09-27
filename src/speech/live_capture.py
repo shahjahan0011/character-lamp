@@ -18,6 +18,7 @@ the reference implementation this pipeline is adapted from.
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 
 import numpy as np
@@ -29,13 +30,14 @@ CHUNK_MS = 100
 CHUNK_SAMPLES = INPUT_SAMPLE_RATE * CHUNK_MS // 1000
 
 MIN_SPEECH_RMS = 60  # see capture.py's identical constant/rationale
-SILENCE_CHUNKS_TO_END = 6  # ~600ms of quiet after speech ends the utterance
+SILENCE_CHUNKS_TO_END = 4  # ~400ms: responsive, while still tolerating short natural pauses
 
 
 class LiveMicStreamer:
     def __init__(
         self,
         live_client: GeminiLiveClient,
+        speech_rms_threshold: float = MIN_SPEECH_RMS,
         on_debug: Callable[[str], None] | None = None,
     ):
         self._live = live_client
@@ -43,6 +45,8 @@ class LiveMicStreamer:
         self._stream: sd.InputStream | None = None
         self._speaking = False
         self._quiet_run = 0
+        self._speech_rms_threshold = max(1.0, float(speech_rms_threshold))
+        self._last_meter_log_at = 0.0
 
     def start(self) -> None:
         self._stream = sd.InputStream(
@@ -76,7 +80,18 @@ class LiveMicStreamer:
 
         samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
         rms = float(np.sqrt(np.mean(samples**2))) if len(samples) else 0.0
-        loud = rms >= MIN_SPEECH_RMS
+        loud = rms >= self._speech_rms_threshold
+
+        # Kept at DEBUG via the caller, and rate-limited to once per second.
+        # This turns the formerly opaque "the lamp heard nothing" failure
+        # into a number the user can act on with --mic-threshold.
+        now = time.monotonic()
+        if now - self._last_meter_log_at >= 1.0:
+            self._last_meter_log_at = now
+            self._on_debug(
+                f"live mic: rms={rms:.0f} threshold={self._speech_rms_threshold:.0f} "
+                f"speaking={self._speaking}"
+            )
 
         if loud:
             if not self._speaking:

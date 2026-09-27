@@ -5,6 +5,9 @@ moments. Run `python scripts/run_character.py`, place one small object
 (e.g. a red mug) in view of the camera, and follow along. Actual model
 replies vary — this is a guide, not a transcript.
 
+For a timed, recording-ready shot list with exact dialogue and a post-take
+checklist, use [`DEMO_VIDEO_SCRIPT.md`](DEMO_VIDEO_SCRIPT.md).
+
 ## Setup
 
 - A well-lit room, laptop camera pointed at where you'll sit.
@@ -29,7 +32,7 @@ back to re-engage before continuing.
 ## 2. Spoken interaction (moment 3)
 
 Say something simple: *"Hi there, how are you?"* A local silence
-detector commits your utterance about 600ms after you stop talking; the
+detector commits your utterance about 400ms after you stop talking; the
 light shifts to a cool "thinking" color with a soft hum while the reply
 is in flight, then the lamp answers out loud (Gemini Live, persistent
 session — no per-turn reconnect) and reacts with a matching gesture

@@ -36,6 +36,8 @@ import random
 import time
 from collections.abc import Callable
 
+from pydantic import ValidationError
+
 from src.body.executor import ActionExecutor
 from src.character.character_state import (
     CharacterState,
@@ -50,6 +52,7 @@ from src.character.scene_observer import SceneObserver
 from src.character.tool_gateway import ToolGateway
 from src.perception.engagement import EngagementWatcher
 from src.protocol.models import Action
+from src.protocol.tools import PerformGestureArgs
 from src.speech.audio_mixer import AudioMixer
 from src.speech.error_speech import ErrorSpeech
 from src.speech.live_client import GeminiLiveClient, LiveEvent
@@ -82,7 +85,7 @@ IDLE_BRIGHTNESS = 0.2
 ENGAGED_BRIGHTNESS = 1.0
 # A brief warm/golden glow the instant local loudness detection notices
 # someone start talking -- well before the utterance is actually committed
-# (~600ms after they stop) -- so the character visibly reacts to being
+# (~400ms after they stop) -- so the character visibly reacts to being
 # spoken to immediately, not just once it's done "thinking" about a reply.
 LISTENING_COLOR = [1.0, 0.85, 0.5]
 # A cool, dim, distinct color, a repeated gentle "pondering" gesture, and a
@@ -185,7 +188,6 @@ class CharacterOrchestrator:
         self._turn_deadline = 0.0
         self._awaiting_first_audio = False
         self._next_reobserve_at = 0.0
-        self._nudged_this_engagement = False
         self._output_drained_at: float | None = None
         # Starts disengaged, so the idle music starts playing immediately.
         self.executor.run(Action(kind="music_on", params={}))
@@ -260,6 +262,7 @@ class CharacterOrchestrator:
             if event.kind == "connected":
                 self._on_debug("live: connected")
             elif event.kind == "speech_started":
+                self.metrics.event("speech_started")
                 if currently_engaged and not self._turn_in_flight:
                     self.executor.run(
                         Action(
@@ -268,10 +271,12 @@ class CharacterOrchestrator:
                         )
                     )
             elif event.kind == "speech_committed":
+                self.metrics.event("speech_committed")
                 self._on_turn_started()
             elif event.kind == "audio_chunk":
                 self._on_audio_chunk(currently_engaged)
             elif event.kind == "tool_call":
+                self.metrics.event("tool_call", tool_name=event.tool_name)
                 self._on_tool_call(event)
             elif event.kind == "turn_complete":
                 self._on_turn_complete(currently_engaged)
@@ -279,6 +284,7 @@ class CharacterOrchestrator:
                 self.audio_mixer.interrupt_speech()
                 self._on_debug("live: playback interrupted (barge-in)")
             elif event.kind == "error":
+                self.metrics.event("live_error", message=event.message)
                 self._on_debug(f"live: error: {event.message}")
                 if currently_engaged and self.error_speech is not None:
                     now = time.monotonic()
@@ -336,6 +342,21 @@ class CharacterOrchestrator:
         call_id = event.tool_call_id or ""
         if name in ("look_at_image_point", "set_light", "perform_gesture"):
             self._try_transition(CharacterState.ACTING)
+        if name == "perform_gesture":
+            # This tool is declared NON_BLOCKING. Validate first, then
+            # acknowledge that the gesture has started before running the
+            # synchronous animation. Gemini can begin speaking immediately,
+            # while the Live receive thread continues feeding audio directly
+            # to the mixer during the movement.
+            try:
+                PerformGestureArgs.model_validate(args)
+            except ValidationError:
+                result = self.gateway.execute(name, args, call_id)
+                self.live_client.submit_tool_result(call_id, name, result or {"ok": False})
+                return
+            self.live_client.submit_tool_result(call_id, name, {"ok": True, "status": "started"})
+            self.gateway.execute(name, args, call_id)
+            return
         result = self.gateway.execute(name, args, call_id)
         if result is not None:
             self.live_client.submit_tool_result(call_id, name, result)
@@ -461,27 +482,11 @@ class CharacterOrchestrator:
                 self.live_client.submit_tool_result(result.tool_call_id, result.tool_name or "request_observation", payload)
             return
 
-        # Ambient "scene" observation (demo moment 4). Confirmed live:
-        # injecting scene-memory text mid-conversation via
-        # send_realtime_input(text=...) makes Gemini speak in response
-        # EVERY time, even with an explicit "don't say anything, this is
-        # silent" instruction in the text itself -- that's what "randomly
-        # started describing the scenery" turned out to be. The Live API
-        # also explicitly warns against mixing send_client_content (whose
-        # turn_complete=False *would* inject silently) with the continuous
-        # send_realtime_input audio streaming this pipeline already
-        # depends on. Given that, only relay a nudge once per engagement
-        # (right after the first observation completes) rather than on
-        # every periodic re-observation -- local memory still updates
-        # continuously either way (see _check_reobserve), and can also be
-        # recalled on demand via the recall_memory Live tool, so a later
-        # question is answered from whatever's freshest either way; it
-        # just isn't volunteered mid-conversation on its own.
-        if self._nudged_this_engagement:
-            return
-        self._nudged_this_engagement = True
-        if self.live_client is not None:
-            self.live_client.send_text_nudge(self.memory.as_context_text())
+        # Ambient observations update local SceneMemory only. An earlier
+        # version also injected the memory as realtime text into Gemini;
+        # realtime text starts a model turn, so it raced the person's first
+        # utterance and caused long or missing replies. Recall is already a
+        # real tool, so the model can fetch this same memory on demand.
 
     def _observe_scene(self) -> None:
         """Kicks off one ambient scene-description call (demo moment 4) --
@@ -514,6 +519,12 @@ class CharacterOrchestrator:
         if self.audio_mixer is not None:
             underflow, overflow = self.audio_mixer.pop_xrun_counts()
             if underflow or overflow:
+                self.metrics.event(
+                    "audio_xrun",
+                    underflow=underflow,
+                    overflow=overflow,
+                    movement=recent_movement["kind"] if recent_movement is not None else None,
+                )
                 # Real PortAudio-reported xruns (not a guess) -- logging
                 # whether one coincided with a movement action this same
                 # tick is exactly the evidence needed to confirm or rule
@@ -553,7 +564,6 @@ class CharacterOrchestrator:
         # Mic gate opens on the next tick via _update_mic_gate (engaged,
         # no turn in flight, nothing playing) -- no separate call needed.
         self._try_transition(CharacterState.ENGAGED)
-        self._nudged_this_engagement = False
         self._observe_scene()
         self._next_reobserve_at = time.monotonic() + REOBSERVE_INTERVAL_S
 

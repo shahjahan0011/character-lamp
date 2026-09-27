@@ -1,152 +1,157 @@
-# Technical Note — Character Lamp
+# Technical note — Character Lamp
 
-*Target length: 2 pages. See README.md for setup and DEMO_SCRIPT.md for the walkthrough.*
+I built the lamp around one simple rule: attention should be shared by every
+part of the character. Face detection does not merely trigger an animation;
+it decides when the music stops, when the microphone may stream, when replies
+may play, and when the lamp should return home. That is what keeps the demo
+from feeling like separate vision, chatbot, and robot samples.
 
-## Architecture and data flow
+## The system I ended up with
 
+```text
+ webcam ─► EngagementWatcher ───────┐
+           face + hysteresis        │
+                                    ▼
+ microphone ─► LiveMicStreamer ─► CharacterOrchestrator (10 Hz) ─► ActionExecutor ─► PyBullet
+                  │                 │          ▲                         │
+                  ▼                 │          │                         └─► light / audio mixer
+          Gemini Live session ──────┤          │
+          voice + tool calls        ▼          │ tool results
+                               ToolGateway ─────┘
+                                    │
+ webcam frame ─► SceneObserver ─────┼─► ObservationRegistry
+                  Gemini vision     ├─► SceneMemory (local JSON)
+                                    └─► GoalCoordinator
 ```
- Camera ──► EngagementWatcher ──► CharacterOrchestrator ──► ActionExecutor ──► PyBullet (kinematic body)
- (thread)   (Haar-cascade face,        │      ▲                   │
-             hysteresis, 10Hz)         │      │                   └──► AudioMixer ──► speaker
-                                       │      │                        (speech+SFX+music, ducked)
- Mic ────► LiveMicStreamer ───────────►│      │
- (thread)   (local VAD, silence-       │      │
-             commit)                  ▼      │
-                              GeminiLiveClient (own asyncio thread)
-                              persistent bidirectional session
-                                       │      ▲
-                    tool_call/audio_chunk      tool_result/mic audio/text nudge
-                                       │      │
-                                       ▼      │
-                                  ToolGateway ──► ObservationRegistry / GoalCoordinator / SceneMemory
-                                       │
-                                       ▼
-                              SceneObserver (own thread) ──► Gemini vision API (schema-constrained JSON)
+
+Camera capture, microphone capture, the Live socket, and scene observation run
+on background threads. The main 10 Hz loop is the only owner of PyBullet and
+the only place that dispatches body actions. I chose this plain threaded shape
+because camera/audio libraries are blocking, Gemini Live is async, and
+PyBullet calls are safest when they stay on one thread. It is less fashionable
+than an event bus, but much easier to trace during a live demo.
+
+Conversation originally used three serial steps: record a whole utterance,
+ask a model for text, then make a second TTS call. It was slow and eventually
+went silent against a small TTS quota. The current version keeps one Gemini
+Live native-audio session open for the process lifetime. Audio chunks go from
+the network thread straight into the mixer so a blocking body gesture cannot
+starve playback. The main loop still receives lightweight “audio started” and
+“turn complete” events for state and lighting.
+
+## Where I trust the model—and where I do not
+
+The model sees seven tools, each generated from a strict Pydantic argument
+model. Coordinates and brightness are bounded, extra fields are rejected, and
+tool calls return structured success or error objects. Stateful tools block
+until their real local result is available. A purely expressive gesture is
+non-blocking so speech can begin while the body reacts instead of waiting for
+the animation to finish.
+
+The model never sees joint names, file paths, motor effort, or arbitrary code.
+It chooses from semantic actions such as `perform_gesture`, `set_light`, and
+`look_at_image_point`. `ToolGateway` validates those choices, and
+`ActionExecutor` is the only layer that translates them into the supplied
+five-joint body.
+
+I was especially careful with the challenge's goal-directed action. Prompting
+the model to “look again” was not enough. `GoalCoordinator` rejects completion
+unless it can prove this order locally:
+
+```text
+fresh planning observation → at least one action → newer verification observation → finish_goal
 ```
 
-Four background threads (camera, mic, Live session, scene observer) each
-expose a thread-safe polled interface; **only the main thread ever
-touches PyBullet or dispatches an `Action`** — `CharacterOrchestrator.tick()`,
-called at 10Hz, is the single point where all four streams are read and
-turned into body/light/audio commands. This mirrors the constraint a
-real embedded lamp would have (one control loop owning the actuators)
-and avoids cross-thread PyBullet calls, which are not thread-safe.
+Observation IDs and monotonic timestamps enforce that ordering. An old memory
+can help conversation, but it cannot authorize a new movement. One retry is
+allowed after an inconclusive check; otherwise the goal fails rather than the
+lamp claiming success.
 
-## Protocol and trust boundary
+`look_at_image_point` maps a normalized camera coordinate to bounded pan and
+tilt. This is intentionally described as approximate image-space pointing.
+Without depth or camera-to-robot calibration, calling it 3-D localization
+would be misleading.
 
-Two closed vocabularies separate "what the model may decide" from "what
-the body can do":
+## Body and physical choices
 
-- **`Action`** (`src/protocol/models.py`) — `look_at`, `point_at`, `nod`,
-  `set_light`, `play_sound`, `home`, etc. The model never names a joint,
-  torque, or file path; `ActionExecutor` is the only thing that knows
-  those.
-- **Gemini Live tools** (`src/protocol/tools.py`) — 7 Pydantic models,
-  each `extra="forbid"` with bounded fields (e.g. `x`/`y` ∈ [0,1]),
-  generated into Gemini's function-calling schema. All run with
-  `behavior: BLOCKING`, so the model waits for a real result (confirmed
-  live) instead of guessing ahead — essential for enforcing goal
-  ordering (see below). `ToolGateway` validates and dispatches every
-  call; a malformed or out-of-order call returns a structured `{"ok":
-  false, "error": ...}` rather than crashing the turn.
+The supplied URDF has joint geometry and limits but no transmissions or motor
+controller. I therefore drive it kinematically with PyBullet
+`resetJointState`. Every move still respects the URDF velocity limits.
+Smoothstep interpolation removes abrupt starts and stops; its peak speed is
+1.5 times its average, so move duration is multiplied by 1.5 rather than using
+the tempting but incorrect `distance / limit` calculation. Multi-joint poses
+share the slowest required duration so they arrive as one gesture.
 
-Cloud usage: Gemini's vision, Live (speech+tool-use), and TTS APIs
-(free tier, Flash models) do all inference — no local model. A camera
-frame is sent only when a specific observation is requested (on
-engage, ~45s while engaged, or a tool call), never streamed
-continuously; mic audio streams only while engaged and no
-turn/playback is in flight. See README.md's privacy section.
+The three fixed semantic links (light, camera, speaker) now have small,
+plausible inertial values. They do not change controlled-joint behavior, but
+they keep the URDF physically complete and prevent PyBullet from inventing a
+unit mass for each link. Idle motion is a small sub-second glance; the original
+full-body wander blocked the attention loop for 3–6 seconds.
 
-## Model-to-action flow (goal-directed action)
+The acknowledgement is deliberately local and deterministic: stop music,
+chime, flash, turn toward the face, nod, and settle to a warm light. A network
+round trip at that moment made the lamp feel inattentive. Language and gesture
+selection remain model-driven once conversation begins.
 
-`GoalCoordinator` enforces, independent of what the model claims: a
-fresh `goal_planning` observation must exist before any action; at
-least one action must be recorded; a `goal_verification` observation
-must be captured *after* that action (by monotonic timestamp); and
-`finish_goal` must reference exactly that verification observation.
-One inconclusive retry is allowed before the goal is marked `failed`.
-This turns "the LLM says it worked" into a checkable invariant — a
-model that skips re-observing, or claims success against a stale
-observation, is rejected locally, not trusted.
+## Deployment and data
 
-`look_at_image_point` converts a normalized 2-D image coordinate to
-pan/tilt (`image_point_to_pan_tilt`, `src/body/executor.py`) — this is
-approximate image-space pointing, not 3-D localization (no depth
-sensing exists in this system).
+This is one Python process for an Ubuntu 24.04 laptop with four CPU cores, 8 GB
+RAM, camera, standard audio, and Wi-Fi. It has no CUDA or local-model
+dependency. Python 3.11 is the tested interpreter. The README contains the
+exact setup and four checks I would run before presenting.
 
-## Simulation and physical reasoning
+Gemini receives 16 kHz microphone PCM while the lamp is engaged. It receives a
+single camera frame on engagement, on an explicit tool request, and at a
+45-second engaged refresh. Frames and audio are not persisted. The only saved
+content is a small JSON list of object descriptions plus JSONL operational
+metrics. This is a conscious cloud tradeoff: much less local compute and a
+better voice interaction, in exchange for Wi-Fi, API availability, and quota
+dependence.
 
-PyBullet loads the supplied URDF unmodified and drives joints
-*kinematically* (`resetJointState`, not motor/dynamics control) — the
-URDF defines no `<transmission>`, so there's nothing for a PD controller
-to actuate. `TrajectoryPlayer` still respects the URDF's own per-joint
-velocity limits: moves are smoothstep-interpolated (zero velocity at
-both ends, avoiding jerk at move boundaries), with duration scaled by
-1.5× (`SMOOTHSTEP_PEAK_FACTOR`) because a smoothstep's *peak*
-instantaneous velocity is 1.5× its average — computing duration from
-plain `distance / max_velocity` would silently violate the limit at
-the midpoint of every move. Multi-joint moves share one synchronized
-duration so a "return home" gesture settles as one motion, not several
-joints arriving at different times.
+## Evidence, including the awkward parts
 
-## Deployment
+- The automated suite contains **124 tests**. It covers the state machine,
+  actions, schemas, observation freshness, memory, goal ordering, and the
+  async tool-result path without touching hardware or the network.
+- The offline end-to-end run completes all eight scripted stages using the
+  production gateway, goal coordinator, memory, executor, and simulator.
+- A real Gemini Live probe on 26 September 2026 connected to
+  `gemini-3.8-live`, completed a `perform_gesture` call, returned audio, and
+  closed the turn. The latest hardware log measured warm first-audio latency
+  at **2.22–2.50 seconds**, with one **7.21-second** cold/tool outlier. These
+  are small development samples, not a benchmark. After removing the hidden
+  ambient text turn and making expressive gestures asynchronous, the final
+  API self-check reached first audio in **1.19 seconds**.
+- A real structured-vision probe through the final API path returned the
+  synthetic red object at normalized `(0.71, 0.45)`. A separate error-voice
+  probe returned a valid **67,506-byte RIFF/WAV**. Both previously used an
+  experimental endpoint that rejected this API key with HTTP 401; they now use
+  the supported `models.generate_content` path.
+- The saved attempted hardware run recorded three engagements and one
+  disengagement but no completed voice turn. That was useful: it localized the
+  observed “no reply” problem before the model boundary. I added explicit
+  metrics for mic start/commit/tool/error events, a debug RMS meter, an
+  adjustable mic threshold, and a hardware-free `--check-live` command instead
+  of hiding the gap behind a claim that everything had been tested.
+- That same mixed macOS log (727 seconds, including GUI/camera runs) reports
+  **122% mean process CPU** after discarding the first sample and **633 MB peak
+  RSS**. One core equals 100%, so it uses roughly 1.2 of the four target cores.
+  This is more representative than the earlier headless-only floor, but it is
+  still not an Ubuntu measurement.
 
-Plain Python process (`python scripts/run_character.py`), no daemon/
-container — matches a single always-on lamp, not a multi-tenant
-service. `pyproject.toml` pins `requires-python>=3.11,<3.13` because
-PyBullet ships prebuilt wheels for cp311 but not cp312+, and Ubuntu
-24.04's default `python3` is 3.12 (see README.md's `deadsnakes` PPA
-step). No GPU/CUDA dependency, matching the target's constraints.
+Engagement accuracy is not formally measured. The mechanism has asymmetric
+hysteresis—three positive detections to engage, fifteen misses to disengage—
+but I do not have labeled camera trials from the target laptop. Before a final
+demo I would run 20 approach/look-away trials and report successful engages,
+false drops, and median transition time from the existing event log.
 
-## Measurements
+## What I would improve next
 
-**Response latency (first audio byte after utterance end), real API,
-warm connection** — measured manually during development against the
-live Gemini API (not fabricated; see `src/speech/live_client.py`'s
-module docstring for the original measurement notes): `gemini-3.8-live`
-landed **~1.2s**; the documented fallback model,
-`gemini-2.5-flash-native-audio-latest`, landed **~1.7–2.2s** across
-repeated real turns. A fresh/cold connection's *first* turn occasionally
-took 10+ seconds (one outlier in ~10 real calls) — this is why the
-client connects once at startup and stays connected for the app's whole
-lifetime, rather than reconnecting per turn. These are small-sample,
-manual dev-time measurements, not a large statistical benchmark.
-
-**CPU / memory** — measured with this repo's own instrumentation
-(`src/character/metrics.py`, real `psutil` samples, JSONL, see
-`scripts/summarize_metrics.py`), on the macOS development machine (not
-the Ubuntu target — see "Known limitations"), in `--offline --headless`
-mode (no camera/mic/network — simulation + audio mixer + goal/memory
-workflow only): steady-state idle 10Hz polling loop over 20s measured
-**peak RSS 138 MB**, **mean process CPU ~0.2% of one core**. Startup
-(PyBullet + numpy + OpenCV import and init) is the dominant cost, not
-the steady-state loop. These numbers exclude the camera/mic capture
-threads and any live network call, so they are a floor, not a full
-live-session measurement.
-
-**Engagement reliability** — **not measured**: this requires labeled
-trials with a real person in front of a real camera, which this
-development/verification environment could not perform (no interactive
-camera access in the agent sandbox used to build this). The intended
-procedure: face the camera, log `EngagementWatcher`'s `changed_at`
-transitions against ground truth for ~20 trials, and report true/false
-engagement rate and median engage/disengage latency. This is left as an
-explicit gap rather than a fabricated number — see Known limitations.
-
-## Known limitations
-
-- Engagement reliability is unmeasured (see above) — the mechanism
-  (Haar-cascade face detection with a consecutive-frame hysteresis) is
-  implemented and used live in earlier development, but no formal trial
-  set was run.
-- CPU/RSS measurements are from macOS, not the Ubuntu 24.04 target, and
-  exclude camera/mic capture and any live network call.
-- `robot/dummy-lamp.png` (referenced by `CHALLENGE.md`) was never
-  present in this repository's history — reported honestly rather than
-  fabricated (see README.md).
-- Pointing is 2-D image-space only; no depth/3-D localization.
-- Single simple engagement gate — no multi-person handling, no
-  identity/re-engagement memory across sessions.
-- Vision/TTS run on Gemini's free tier, which is rate-limited; a
-  sustained demo can exhaust a daily quota (`REOBSERVE_BACKOFF_S`
-  backs off automatically rather than retry-looping).
+First, I would calibrate microphone RMS and camera-to-lamp pointing on the
+actual presentation laptop. Next I would replace Haar detection with a more
+robust lightweight face-or-attention signal, while preserving the same local
+engagement contract. With more time and hardware, depth or a calibrated camera
+transform would turn the current “look toward it” action into defensible 3-D
+pointing. Multi-person attention, offline inference, and a richer memory are
+valuable, but I would not add them before the core five-minute interaction is
+rehearsed and measured end to end.

@@ -43,18 +43,19 @@ def test_parse_objects_handles_missing_objects_key():
     assert vision._parse_objects(json.dumps({"something_else": []})) == []
 
 
-def test_describe_scene_returns_structured_observation_mocked():
+def test_describe_scene_returns_structured_observation_mocked(monkeypatch):
+    monkeypatch.setenv("GEMINI_VISION_MODEL", "test-vision-model")
     frame = np.zeros((240, 320, 3), dtype=np.uint8)
     fake_response_json = json.dumps({
         "objects": [
             {"label": "Book", "attributes": "hardcover", "color": "red", "image_x": 0.2, "image_y": 0.3, "confidence": 0.8},
         ]
     })
-    with patch("src.speech.vision.get_client") as mock_get_client, \
-         patch("src.speech.vision.collect_text_stream", return_value=fake_response_json):
-        mock_get_client.return_value.interactions.create.return_value = MagicMock()
+    with patch("src.speech.vision.get_client") as mock_get_client:
+        mock_get_client.return_value.models.generate_content.return_value = MagicMock(text=fake_response_json)
         obs = vision.describe_scene(frame, purpose="goal_planning")
 
+    assert mock_get_client.return_value.models.generate_content.call_args.kwargs["model"] == "test-vision-model"
     assert obs.purpose == "goal_planning"
     assert obs.width == 320
     assert obs.height == 240

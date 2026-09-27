@@ -2,9 +2,8 @@
 Action in models.py: a strict, validated boundary the model reasons over,
 never a raw frame or an unvalidated blob of text.
 
-Confirmed live before building this: Gemini's interactions.create()
-supports response_format={"type": "text", "mime_type": "application/json",
-"schema": {...}}, and grounds normalized image coordinates accurately
+Gemini's generate_content API is constrained by a JSON response schema
+and grounds normalized image coordinates accurately
 against known object positions in a test image (within ~1% of the
 computed true center). That's what DetectedObject.image_x/image_y rely
 on -- see vision.py.
